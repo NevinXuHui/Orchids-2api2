@@ -37,6 +37,7 @@ Thumbs.db
 
 
 # Config
+config.json
 
 # Database
 *.db
@@ -52,3 +53,17 @@ dist/
 
 # Test
 test/
+
+# Claude Code & OMC
+.claude/
+.omc/
+.spec-workflow/
+CLAUDE.md
+**/CLAUDE.md
+
+# Local History
+.lh/
+
+# Runtime
+.orchids.pid
+server.log
