@@ -3,17 +3,18 @@ package orchids
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"orchids-api/internal/clerk"
 	"orchids-api/internal/config"
@@ -100,24 +101,18 @@ func shouldLogNoActiveSession(key string) bool {
 }
 
 func newHTTPClient(cfg *config.Config) *http.Client {
-	transport := &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-	}
+	var proxyFunc func(*http.Request) (*url.URL, error)
+	proxyKey := "direct"
 
 	if cfg != nil {
-		transport.Proxy = util.ProxyFunc(cfg.ProxyHTTP, cfg.ProxyHTTPS, cfg.ProxyUser, cfg.ProxyPass, cfg.ProxyBypass)
+		proxyFunc = util.ProxyFunc(cfg.ProxyHTTP, cfg.ProxyHTTPS, cfg.ProxyUser, cfg.ProxyPass, cfg.ProxyBypass)
+		proxyKey = util.GenerateProxyKey(cfg.ProxyHTTP, cfg.ProxyHTTPS, cfg.ProxyUser)
 	} else {
-		transport.Proxy = http.ProxyFromEnvironment
+		proxyFunc = http.ProxyFromEnvironment
 	}
 
-	return &http.Client{
-		Transport: transport,
-	}
+	// Use shared http.Client to preserve connection pool TCP/TLS cache.
+	return util.GetSharedHTTPClient(proxyKey, 30*time.Second, proxyFunc)
 }
 
 func New(cfg *config.Config) *Client {
@@ -408,19 +403,7 @@ func (c *Client) persistAccountInfo(info *clerk.AccountInfo) {
 	}
 }
 
-// SyncAccountState 检查 forceRefreshToken 是否更新了账号信息，返回是否有实际变更。
-// 通过快照比较避免基于 UpdatedAt 的不可靠检测。
-func (c *Client) SyncAccountState(snapshot *store.Account) bool {
-	if c.account == nil || snapshot == nil {
-		return false
-	}
-	return c.account.SessionID != snapshot.SessionID ||
-		c.account.ClientUat != snapshot.ClientUat ||
-		c.account.ProjectID != snapshot.ProjectID ||
-		c.account.UserID != snapshot.UserID ||
-		c.account.Email != snapshot.Email ||
-		c.account.ClientCookie != snapshot.ClientCookie
-}
+// (method SyncAccountState removed to use store.Account.SyncState logic)
 
 func (c *Client) SendRequest(ctx context.Context, prompt string, chatHistory []interface{}, model string, onMessage func(upstream.SSEMessage), logger *debug.Logger) error {
 	req := upstream.UpstreamRequest{
@@ -824,42 +807,5 @@ func InvalidateCachedToken(sessionID string) {
 }
 
 func tokenExpiry(token string) time.Time {
-	firstDot := strings.IndexByte(token, '.')
-	if firstDot < 0 {
-		return time.Time{}
-	}
-	rest := token[firstDot+1:]
-	secondDot := strings.IndexByte(rest, '.')
-	if secondDot < 0 {
-		return time.Time{}
-	}
-
-	payload, err := base64.RawURLEncoding.DecodeString(rest[:secondDot])
-	if err != nil {
-		return time.Time{}
-	}
-
-	var claims map[string]interface{}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return time.Time{}
-	}
-
-	expValue, ok := claims["exp"]
-	if !ok {
-		return time.Time{}
-	}
-
-	var exp int64
-	switch v := expValue.(type) {
-	case float64:
-		exp = int64(v)
-	case json.Number:
-		exp, _ = v.Int64() // Error ignored as we return 0 on failure anyway
-	}
-
-	if exp == 0 {
-		return time.Time{}
-	}
-
-	return time.Unix(exp, 0).Add(-tokenExpirySkew)
+	return util.JWTExpiry(token, tokenExpirySkew)
 }

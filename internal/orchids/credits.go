@@ -2,8 +2,8 @@ package orchids
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"github.com/goccy/go-json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -311,12 +311,6 @@ func fetchText(ctx context.Context, url string, proxyFunc func(*http.Request) (*
 		return "", err
 	}
 	return string(body), nil
-}
-
-// FetchCredits fetches the user's credits info from Orchids via RSC Server Action.
-// It requires a valid Clerk __session JWT token and the Clerk userId.
-func FetchCredits(ctx context.Context, sessionJWT string, userID string) (*CreditsInfo, error) {
-	return FetchCreditsWithProxy(ctx, sessionJWT, userID, nil)
 }
 
 // FetchCreditsWithProxy fetches credits info using an optional proxy function.

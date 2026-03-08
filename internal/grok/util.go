@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,7 +17,97 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goccy/go-json"
+
 	apperrors "orchids-api/internal/errors"
+)
+
+var (
+	reToolUsageCardBlock      = regexp.MustCompile(`(?is)<?xai:tool_usage_card[^>]*>.*?</xai:tool_usage_card>`)
+	reToolUsageCardIncomplete = regexp.MustCompile(`(?is)<?xai:tool_usage_card.*?(?:</xai:tool_usage_card>|\z)`)
+	reGrokRenderBlock         = regexp.MustCompile(`(?is)<?grok:render.*?</grok:render>`)
+
+	rateLimitLimitKeys = map[string]struct{}{
+		"limit":          {},
+		"limit_tokens":   {},
+		"limittokens":    {},
+		"max_tokens":     {},
+		"maxtokens":      {},
+		"max_queries":    {},
+		"maxqueries":     {},
+		"query_limit":    {},
+		"querylimit":     {},
+		"queries_limit":  {},
+		"querieslimit":   {},
+		"token_limit":    {},
+		"tokenlimit":     {},
+		"tokens_limit":   {},
+		"tokenslimit":    {},
+		"total_tokens":   {},
+		"totaltokens":    {},
+		"total_queries":  {},
+		"totalqueries":   {},
+		"quota":          {},
+		"quota_limit":    {},
+		"quotalimit":     {},
+		"request_limit":  {},
+		"requestlimit":   {},
+		"requests_limit": {},
+		"requestslimit":  {},
+	}
+	rateLimitRemainingKeys = map[string]struct{}{
+		"remaining":          {},
+		"remaining_tokens":   {},
+		"remainingtokens":    {},
+		"tokens_remaining":   {},
+		"tokensremaining":    {},
+		"remaining_queries":  {},
+		"remainingqueries":   {},
+		"queries_remaining":  {},
+		"queriesremaining":   {},
+		"quota_remaining":    {},
+		"quotaremaining":     {},
+		"remaining_requests": {},
+		"remainingrequests":  {},
+	}
+	rateLimitResetKeys = map[string]struct{}{
+		"reset":           {},
+		"reset_at":        {},
+		"resetat":         {},
+		"reset_at_ms":     {},
+		"resetatms":       {},
+		"reset_time":      {},
+		"resettime":       {},
+		"reset_timestamp": {},
+		"resettimestamp":  {},
+		"next_reset":      {},
+		"nextreset":       {},
+	}
+	renderableImageExtensions = []string{".png", ".jpg", ".jpeg", ".webp", ".gif"}
+	allowedMessageRoles       = map[string]struct{}{
+		"developer": {},
+		"system":    {},
+		"user":      {},
+		"assistant": {},
+	}
+	userContentTypes = map[string]struct{}{
+		"text":        {},
+		"image_url":   {},
+		"input_audio": {},
+		"file":        {},
+	}
+	videoAspectRatioMap = map[string]string{
+		"1280x720":  "16:9",
+		"720x1280":  "9:16",
+		"1792x1024": "3:2",
+		"1024x1792": "2:3",
+		"1024x1024": "1:1",
+		"16:9":      "16:9",
+		"9:16":      "9:16",
+		"3:2":       "3:2",
+		"2:3":       "2:3",
+		"1:1":       "1:1",
+	}
 )
 
 func randomHex(n int) string {
@@ -33,26 +122,32 @@ func randomHex(n int) string {
 }
 
 func buildStatsigID() string {
-	msg := "e:TypeError: Cannot read properties of undefined (reading 'childNodes')"
+	// Base64 encode a fake JS error string similar to AIClient-2-API StatsigGenerator
+	msg := fmt.Sprintf("e:TypeError: Cannot read properties of null (reading 'children['%s']')", randomHex(5))
+	if time.Now().UnixNano()%2 == 0 {
+		msg = fmt.Sprintf("e:TypeError: Cannot read properties of undefined (reading '%s')", randomHex(10))
+	}
 	return base64.StdEncoding.EncodeToString([]byte(msg))
 }
 
 func parseUpstreamLines(body io.Reader, onLine func(map[string]interface{}) error) error {
 	decoder := json.NewDecoder(body)
+	type upstreamLineEnvelope struct {
+		Result struct {
+			Response map[string]interface{} `json:"response"`
+		} `json:"result"`
+	}
+
 	for {
-		var raw map[string]interface{}
-		if err := decoder.Decode(&raw); err != nil {
+		var line upstreamLineEnvelope
+		if err := decoder.Decode(&line); err != nil {
 			if err == io.EOF {
 				return nil
 			}
 			return err
 		}
-		result, ok := raw["result"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		resp, ok := result["response"].(map[string]interface{})
-		if !ok {
+		resp := line.Result.Response
+		if resp == nil {
 			continue
 		}
 		if err := onLine(resp); err != nil {
@@ -181,7 +276,7 @@ func stripToolAndRenderMarkup(text string) string {
 		return text
 	}
 	// Convert xai tool cards into readable text.
-	text = regexp.MustCompile(`(?is)<?xai:tool_usage_card[^>]*>.*?</xai:tool_usage_card>`).ReplaceAllStringFunc(text, func(raw string) string {
+	text = reToolUsageCardBlock.ReplaceAllStringFunc(text, func(raw string) string {
 		line := extractToolUsageCardText(raw)
 		if line == "" {
 			return ""
@@ -189,9 +284,9 @@ func stripToolAndRenderMarkup(text string) string {
 		return "\n" + line + "\n"
 	})
 	// Drop incomplete tool cards.
-	text = regexp.MustCompile(`(?is)<?xai:tool_usage_card.*?(?:</xai:tool_usage_card>|\z)`).ReplaceAllString(text, "")
+	text = reToolUsageCardIncomplete.ReplaceAllString(text, "")
 	// Remove grok render tags (allow optional leading '<')
-	text = regexp.MustCompile(`(?is)<?grok:render.*?</grok:render>`).ReplaceAllString(text, "")
+	text = reGrokRenderBlock.ReplaceAllString(text, "")
 	return strings.TrimSpace(text)
 }
 
@@ -201,33 +296,18 @@ func extractToolUsageCardText(raw string) string {
 		return ""
 	}
 
-	tagText := func(input, tag string) string {
-		pat := fmt.Sprintf(`(?is)<%s>(.*?)</%s>`, regexp.QuoteMeta(tag), regexp.QuoteMeta(tag))
-		m := regexp.MustCompile(pat).FindStringSubmatch(input)
-		if len(m) < 2 {
-			return ""
-		}
-		val := strings.TrimSpace(m[1])
-		// unwrap <![CDATA[...]]>
-		val = regexp.MustCompile(`(?is)<!\[CDATA\[(.*?)\]\]>`).ReplaceAllString(val, "$1")
-		return strings.TrimSpace(val)
-	}
-	name := tagText(raw, "xai:tool_name")
-	argsRaw := tagText(raw, "xai:tool_args")
+	name := extractToolUsageTagValue(raw, "xai:tool_name")
+	argsRaw := extractToolUsageTagValue(raw, "xai:tool_args")
 
-	var payload map[string]interface{}
-	if strings.TrimSpace(argsRaw) != "" {
-		_ = json.Unmarshal([]byte(argsRaw), &payload)
+	var payload struct {
+		Query            string `json:"query"`
+		Q                string `json:"q"`
+		ImageDescription string `json:"image_description"`
+		Description      string `json:"description"`
+		Message          string `json:"message"`
 	}
-	read := func(keys ...string) string {
-		for _, key := range keys {
-			v, _ := payload[key]
-			s := strings.TrimSpace(fmt.Sprint(v))
-			if s != "" && s != "<nil>" {
-				return s
-			}
-		}
-		return ""
+	if argsRaw != "" {
+		_ = json.Unmarshal([]byte(argsRaw), &payload)
 	}
 
 	label := strings.TrimSpace(name)
@@ -235,17 +315,17 @@ func extractToolUsageCardText(raw string) string {
 	switch label {
 	case "web_search":
 		label = "[WebSearch]"
-		if s := read("query", "q"); s != "" {
+		if s := firstNonEmpty(payload.Query, payload.Q); s != "" {
 			text = s
 		}
 	case "search_images":
 		label = "[SearchImage]"
-		if s := read("image_description", "description", "query"); s != "" {
+		if s := firstNonEmpty(payload.ImageDescription, payload.Description, payload.Query); s != "" {
 			text = s
 		}
 	case "chatroom_send":
 		label = "[AgentThink]"
-		if s := read("message"); s != "" {
+		if s := payload.Message; s != "" {
 			text = s
 		}
 	}
@@ -259,8 +339,75 @@ func extractToolUsageCardText(raw string) string {
 		return text
 	default:
 		// Fallback: strip tags and return plain text if any.
-		return strings.TrimSpace(regexp.MustCompile(`(?is)<[^>]+>`).ReplaceAllString(raw, ""))
+		return strings.TrimSpace(stripAngleTags(raw))
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func extractToolUsageTagValue(raw, tag string) string {
+	if raw == "" || tag == "" {
+		return ""
+	}
+	lower := strings.ToLower(raw)
+	openTag := "<" + strings.ToLower(tag) + ">"
+	closeTag := "</" + strings.ToLower(tag) + ">"
+	start := strings.Index(lower, openTag)
+	if start < 0 {
+		return ""
+	}
+	start += len(openTag)
+	if start >= len(raw) {
+		return ""
+	}
+	endRel := strings.Index(lower[start:], closeTag)
+	if endRel < 0 {
+		return ""
+	}
+	val := strings.TrimSpace(raw[start : start+endRel])
+	if val == "" {
+		return ""
+	}
+	trimmed := strings.TrimSpace(val)
+	lowerTrimmed := strings.ToLower(trimmed)
+	if strings.HasPrefix(lowerTrimmed, "<![cdata[") && strings.HasSuffix(lowerTrimmed, "]]>") && len(trimmed) >= len("<![CDATA[]]>") {
+		trimmed = strings.TrimSpace(trimmed[len("<![CDATA[") : len(trimmed)-len("]]>")])
+	}
+	return strings.TrimSpace(trimmed)
+}
+
+func stripAngleTags(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	inTag := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch ch {
+		case '<':
+			inTag = true
+		case '>':
+			if inTag {
+				inTag = false
+			} else {
+				b.WriteByte(ch)
+			}
+		default:
+			if !inTag {
+				b.WriteByte(ch)
+			}
+		}
+	}
+	return b.String()
 }
 
 func extractRenderableImageLinks(value interface{}) []string {
@@ -277,7 +424,7 @@ func extractRenderableImageLinks(value interface{}) []string {
 		if strings.Contains(ls, "assets.grok.com") {
 			return true
 		}
-		for _, ext := range []string{".png", ".jpg", ".jpeg", ".webp", ".gif"} {
+		for _, ext := range renderableImageExtensions {
 			if strings.Contains(ls, ext) {
 				return true
 			}
@@ -509,12 +656,26 @@ func NormalizeSSOToken(raw string) string {
 	if token == "" {
 		return ""
 	}
-	lower := strings.ToLower(token)
-	if idx := strings.Index(lower, "sso="); idx >= 0 {
-		token = token[idx+len("sso="):]
-		if semi := strings.Index(token, ";"); semi >= 0 {
-			token = token[:semi]
+
+	// Cookie-style input: scan pairs and prefer exact "sso" key.
+	if strings.Contains(token, ";") {
+		parts := strings.Split(token, ";")
+		for _, part := range parts {
+			kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(kv[0]), "sso") {
+				return strings.TrimSpace(kv[1])
+			}
 		}
+		return strings.TrimSpace(token)
+	}
+
+	// Plain "sso=<token>" input.
+	lower := strings.ToLower(strings.TrimSpace(token))
+	if strings.HasPrefix(lower, "sso=") {
+		return strings.TrimSpace(token[len("sso="):])
 	}
 	return strings.TrimSpace(token)
 }
@@ -570,78 +731,19 @@ func parseRateLimitPayload(payload map[string]interface{}) *RateLimitInfo {
 		return nil
 	}
 
-	limitKeys := map[string]struct{}{
-		"limit":            {},
-		"limit_tokens":     {},
-		"limittokens":      {},
-		"max_tokens":       {},
-		"maxtokens":        {},
-		"max_queries":      {},
-		"maxqueries":       {},
-		"query_limit":      {},
-		"querylimit":       {},
-		"queries_limit":    {},
-		"querieslimit":     {},
-		"token_limit":      {},
-		"tokenlimit":       {},
-		"tokens_limit":     {},
-		"tokenslimit":      {},
-		"total_tokens":     {},
-		"totaltokens":      {},
-		"total_queries":    {},
-		"totalqueries":     {},
-		"quota":            {},
-		"quota_limit":      {},
-		"quotalimit":       {},
-		"request_limit":    {},
-		"requestlimit":     {},
-		"requests_limit":   {},
-		"requestslimit":    {},
-		"request_limiters": {},
-	}
-	remainingKeys := map[string]struct{}{
-		"remaining":          {},
-		"remaining_tokens":   {},
-		"remainingtokens":    {},
-		"tokens_remaining":   {},
-		"tokensremaining":    {},
-		"remaining_queries":  {},
-		"remainingqueries":   {},
-		"queries_remaining":  {},
-		"queriesremaining":   {},
-		"quota_remaining":    {},
-		"quotaremaining":     {},
-		"remaining_requests": {},
-		"remainingrequests":  {},
-	}
-	resetKeys := map[string]struct{}{
-		"reset":           {},
-		"reset_at":        {},
-		"resetat":         {},
-		"reset_at_ms":     {},
-		"resetatms":       {},
-		"reset_time":      {},
-		"resettime":       {},
-		"reset_timestamp": {},
-		"resettimestamp":  {},
-		"next_reset":      {},
-		"nextreset":       {},
-	}
+	var state rateLimitScanState
+	scanRateLimitPayloadValue(payload, &state)
 
-	limit, okLimit := findNumberByKeys(payload, limitKeys)
-	remaining, okRemaining := findNumberByKeys(payload, remainingKeys)
-	resetRaw, okReset := findValueByKeys(payload, resetKeys)
-
-	if !okLimit && !okRemaining && !okReset {
+	if !state.okLimit && !state.okRemaining && !state.okReset {
 		return nil
 	}
 
 	info := &RateLimitInfo{
-		Limit:     limit,
-		Remaining: remaining,
+		Limit:     state.limit,
+		Remaining: state.remaining,
 	}
-	if okReset {
-		info.ResetAt = parseRateLimitReset(fmt.Sprint(resetRaw))
+	if state.okReset {
+		info.ResetAt = state.resetAt
 	}
 	return info
 }
@@ -651,16 +753,96 @@ func classifyAccountStatusFromError(errStr string) string {
 	return apperrors.ClassifyAccountStatus(errStr)
 }
 
-func findNumberByKeys(value interface{}, keys map[string]struct{}) (int64, bool) {
-	raw, ok := findValueByKeys(value, keys)
-	if !ok {
-		return 0, false
+type rateLimitScanState struct {
+	limit       int64
+	remaining   int64
+	resetAt     time.Time
+	okLimit     bool
+	okRemaining bool
+	okReset     bool
+}
+
+func (s *rateLimitScanState) done() bool {
+	return s != nil && s.okLimit && s.okRemaining && s.okReset
+}
+
+func scanRateLimitPayloadValue(value interface{}, state *rateLimitScanState) {
+	if state == nil {
+		return
 	}
+	switch v := value.(type) {
+	case map[string]interface{}:
+		for k, item := range v {
+			key := normalizeRateKey(k)
+			if !state.okLimit {
+				if _, ok := rateLimitLimitKeys[key]; ok {
+					if n, ok := parseNumberAny(item); ok {
+						state.limit = n
+						state.okLimit = true
+					}
+				}
+			}
+			if !state.okRemaining {
+				if _, ok := rateLimitRemainingKeys[key]; ok {
+					if n, ok := parseNumberAny(item); ok {
+						state.remaining = n
+						state.okRemaining = true
+					}
+				}
+			}
+			if !state.okReset {
+				if _, ok := rateLimitResetKeys[key]; ok {
+					if t := parseRateLimitReset(fmt.Sprint(item)); !t.IsZero() {
+						state.resetAt = t
+						state.okReset = true
+					}
+				}
+			}
+		}
+		if state.done() {
+			return
+		}
+		for _, item := range v {
+			scanRateLimitPayloadValue(item, state)
+			if state.done() {
+				return
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			scanRateLimitPayloadValue(item, state)
+			if state.done() {
+				return
+			}
+		}
+	}
+}
+
+func parseNumberAny(raw interface{}) (int64, bool) {
 	switch v := raw.(type) {
 	case int:
 		return int64(v), true
+	case int8:
+		return int64(v), true
+	case int16:
+		return int64(v), true
+	case int32:
+		return int64(v), true
 	case int64:
 		return v, true
+	case uint:
+		return int64(v), true
+	case uint8:
+		return int64(v), true
+	case uint16:
+		return int64(v), true
+	case uint32:
+		return int64(v), true
+	case uint64:
+		if v > uint64(1<<63-1) {
+			return 0, false
+		}
+		return int64(v), true
 	case float64:
 		return int64(v), true
 	case float32:
@@ -675,32 +857,11 @@ func findNumberByKeys(value interface{}, keys map[string]struct{}) (int64, bool)
 		return 0, false
 	case string:
 		return parseRateLimitValue(v)
+	case map[string]interface{}, []interface{}:
+		return 0, false
 	default:
 		return parseRateLimitValue(fmt.Sprint(v))
 	}
-}
-
-func findValueByKeys(value interface{}, keys map[string]struct{}) (interface{}, bool) {
-	switch v := value.(type) {
-	case map[string]interface{}:
-		for k, item := range v {
-			if _, ok := keys[normalizeRateKey(k)]; ok {
-				return item, true
-			}
-		}
-		for _, item := range v {
-			if out, ok := findValueByKeys(item, keys); ok {
-				return out, true
-			}
-		}
-	case []interface{}:
-		for _, item := range v {
-			if out, ok := findValueByKeys(item, keys); ok {
-				return out, true
-			}
-		}
-	}
-	return nil, false
 }
 
 func normalizeRateKey(key string) string {
@@ -727,19 +888,129 @@ func parseRateLimitValue(raw string) (int64, bool) {
 	if raw == "" {
 		return 0, false
 	}
-	if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
+	if v, ok := parseNumericToken(raw); ok {
 		return v, true
 	}
-	if f, err := strconv.ParseFloat(raw, 64); err == nil {
-		return int64(f), true
+	if token := extractFirstNumberToken(raw); token != "" {
+		if v, ok := parseNumericToken(token); ok {
+			return v, true
+		}
 	}
 	return 0, false
+}
+
+func parseNumericToken(token string) (int64, bool) {
+	if token == "" {
+		return 0, false
+	}
+	i := 0
+	if token[0] == '+' || token[0] == '-' {
+		i = 1
+	}
+	if i >= len(token) {
+		return 0, false
+	}
+
+	hasDigit := false
+	hasDot := false
+	for ; i < len(token); i++ {
+		c := token[i]
+		if isDigit(c) {
+			hasDigit = true
+			continue
+		}
+		if c == '.' && !hasDot {
+			hasDot = true
+			continue
+		}
+		return 0, false
+	}
+	if !hasDigit {
+		return 0, false
+	}
+
+	if hasDot {
+		f, err := strconv.ParseFloat(token, 64)
+		if err != nil {
+			return 0, false
+		}
+		return int64(f), true
+	}
+
+	v, err := strconv.ParseInt(token, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+func extractFirstNumberToken(raw string) string {
+	start := -1
+	end := -1
+	seenDot := false
+	seenDigit := false
+
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if start < 0 {
+			if c == '+' || c == '-' {
+				if i+1 < len(raw) && (isDigit(raw[i+1]) || raw[i+1] == '.') {
+					start = i
+					continue
+				}
+				continue
+			}
+			if c == '.' {
+				if i+1 < len(raw) && isDigit(raw[i+1]) {
+					start = i
+					seenDot = true
+					continue
+				}
+				continue
+			}
+			if isDigit(c) {
+				start = i
+				seenDigit = true
+				continue
+			}
+			continue
+		}
+
+		if isDigit(c) {
+			seenDigit = true
+			end = i + 1
+			continue
+		}
+		if c == '.' && !seenDot {
+			seenDot = true
+			if end < 0 {
+				end = i + 1
+			}
+			continue
+		}
+		break
+	}
+
+	if start < 0 || !seenDigit {
+		return ""
+	}
+	if end < 0 {
+		end = len(raw)
+	}
+	return raw[start:end]
+}
+
+func isDigit(c byte) bool {
+	return c >= '0' && c <= '9'
 }
 
 func parseRateLimitReset(raw string) time.Time {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t
 	}
 	if v, ok := parseRateLimitValue(raw); ok {
 		// Treat large values as milliseconds.
@@ -749,9 +1020,6 @@ func parseRateLimitReset(raw string) time.Time {
 		if v > 0 {
 			return time.Unix(v, 0)
 		}
-	}
-	if t, err := time.Parse(time.RFC3339, raw); err == nil {
-		return t
 	}
 	return time.Time{}
 }
@@ -779,22 +1047,10 @@ func normalizeMessageRole(role string) string {
 }
 
 func validateChatMessages(messages []ChatMessage) error {
-	allowedRoles := map[string]struct{}{
-		"developer": {},
-		"system":    {},
-		"user":      {},
-		"assistant": {},
-	}
-	userContentTypes := map[string]struct{}{
-		"text":        {},
-		"image_url":   {},
-		"input_audio": {},
-		"file":        {},
-	}
-
 	for _, msg := range messages {
-		role := strings.TrimSpace(msg.Role)
-		if _, ok := allowedRoles[role]; !ok {
+		roleRaw := strings.TrimSpace(msg.Role)
+		role := strings.ToLower(roleRaw)
+		if _, ok := allowedMessageRoles[role]; !ok {
 			return fmt.Errorf("role must be one of [assistant developer system user]")
 		}
 		switch content := msg.Content.(type) {
@@ -818,17 +1074,18 @@ func validateChatMessages(messages []ChatMessage) error {
 				if !hasType {
 					return fmt.Errorf("content block must have a 'type' field")
 				}
-				blockType := strings.TrimSpace(fmt.Sprint(rawType))
+				blockTypeRaw := strings.TrimSpace(fmt.Sprint(rawType))
+				blockType := strings.ToLower(blockTypeRaw)
 				if blockType == "" {
 					return fmt.Errorf("content block 'type' cannot be empty")
 				}
 
 				if role == "user" {
 					if _, ok := userContentTypes[blockType]; !ok {
-						return fmt.Errorf("invalid content block type: '%s'", blockType)
+						return fmt.Errorf("invalid content block type: '%s'", blockTypeRaw)
 					}
 				} else if blockType != "text" {
-					return fmt.Errorf("the '%s' role only supports 'text' type, got '%s'", role, blockType)
+					return fmt.Errorf("the '%s' role only supports 'text' type, got '%s'", role, blockTypeRaw)
 				}
 
 				switch blockType {
@@ -865,7 +1122,7 @@ func validateChatMessages(messages []ChatMessage) error {
 						return err
 					}
 				default:
-					return fmt.Errorf("invalid content block type: '%s'", blockType)
+					return fmt.Errorf("invalid content block type: '%s'", blockTypeRaw)
 				}
 
 			}
@@ -1145,23 +1402,11 @@ func validateVideoConfig(cfg *VideoConfig) (*VideoConfig, error) {
 	}
 	cfg.Normalize()
 
-	aspectRatioMap := map[string]string{
-		"1280x720":  "16:9",
-		"720x1280":  "9:16",
-		"1792x1024": "3:2",
-		"1024x1792": "2:3",
-		"1024x1024": "1:1",
-		"16:9":      "16:9",
-		"9:16":      "9:16",
-		"3:2":       "3:2",
-		"2:3":       "2:3",
-		"1:1":       "1:1",
-	}
 	ar := strings.TrimSpace(cfg.AspectRatio)
 	if ar == "" {
 		ar = "3:2"
 	}
-	mapped, ok := aspectRatioMap[ar]
+	mapped, ok := videoAspectRatioMap[ar]
 	if !ok {
 		return nil, fmt.Errorf("aspect_ratio must be one of [1280x720 720x1280 1792x1024 1024x1792 1024x1024 16:9 9:16 3:2 2:3 1:1]")
 	}

@@ -2,7 +2,6 @@ package grok
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -10,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"orchids-api/internal/store"
 )
@@ -73,7 +74,26 @@ func (h *Handler) resolveTokenRefreshRequest(r *http.Request) (adminTokenRefresh
 
 	tokens := collectRefreshTokens(req)
 	if len(tokens) == 0 {
-		return req, nil, fmt.Errorf("No tokens provided")
+		// If no explicit tokens given, load all grok accounts
+		if h.lb != nil && h.lb.Store != nil {
+			accounts, err := h.lb.Store.ListAccounts(r.Context())
+			if err != nil {
+				return req, nil, fmt.Errorf("failed to list accounts: %w", err)
+			}
+			for _, acc := range accounts {
+				if !isGrokAccount(acc) {
+					continue
+				}
+				token := grokAccountToken(acc)
+				if token != "" {
+					tokens = append(tokens, token)
+				}
+			}
+			tokens = uniqueStrings(tokens)
+		}
+	}
+	if len(tokens) == 0 {
+		return req, nil, fmt.Errorf("no tokens provided")
 	}
 	return req, tokens, nil
 }
@@ -82,7 +102,6 @@ func updateGrokUsageAccount(acc *store.Account, info *RateLimitInfo, status stri
 	if acc == nil {
 		return
 	}
-	now := time.Now()
 	if info != nil {
 		limit := info.Limit
 		remaining := info.Remaining
@@ -93,17 +112,25 @@ func updateGrokUsageAccount(acc *store.Account, info *RateLimitInfo, status stri
 			limit = remaining
 		}
 		if limit > 0 || remaining > 0 {
+			used := limit - remaining
+			if used < 0 {
+				used = 0
+			}
 			acc.UsageLimit = float64(limit)
-			acc.UsageCurrent = float64(remaining)
+			acc.UsageCurrent = float64(used)
 		}
 		if !info.ResetAt.IsZero() {
 			acc.QuotaResetAt = info.ResetAt
 		}
 	}
-	acc.LastAttempt = now
-	if strings.TrimSpace(status) != "" {
-		acc.StatusCode = status
+	status = strings.TrimSpace(status)
+	if status == "" {
+		acc.StatusCode = ""
+		acc.LastAttempt = time.Time{}
+		return
 	}
+	acc.StatusCode = status
+	acc.LastAttempt = time.Now()
 }
 
 func (h *Handler) runTokenRefreshBatch(
@@ -145,9 +172,9 @@ func (h *Handler) runTokenRefreshBatch(
 			callCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 
-			info, err := h.client.GetUsage(callCtx, token, model)
+			info, err := h.client.VerifyToken(callCtx, token, model)
 			success := err == nil
-			statusCode := "200"
+			statusCode := ""
 			if !success {
 				statusCode = classifyAccountStatusFromError(err.Error())
 				if statusCode == "" {

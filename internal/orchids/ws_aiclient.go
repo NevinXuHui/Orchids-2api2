@@ -2,9 +2,9 @@ package orchids
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/goccy/go-json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -20,25 +20,25 @@ import (
 )
 
 var orchidsAIClientModelMap = map[string]string{
-	"claude-sonnet-4-5":           "claude-sonnet-4-6",
-	"claude-sonnet-4-6":           "claude-sonnet-4-6",
-	"claude-sonnet-4-5-thinking":  "claude-sonnet-4-5-thinking",
-	"claude-sonnet-4-6-thinking":  "claude-sonnet-4-6",
-	"claude-opus-4-6":             "claude-opus-4-6",
-	"claude-opus-4-5":             "claude-opus-4-6",
-	"claude-opus-4-5-thinking":    "claude-opus-4-5-thinking",
-	"claude-opus-4-6-thinking":    "claude-opus-4-6",
-	"claude-haiku-4-5":            "claude-haiku-4-5",
-	"claude-sonnet-4-20250514":    "claude-sonnet-4-20250514",
-	"claude-3-7-sonnet-20250219":  "claude-3-7-sonnet-20250219",
-	"gemini-3-flash":              "gemini-3-flash",
-	"gemini-3-pro":                "gemini-3-pro",
-	"gpt-5.3-codex":               "gpt-5.3-codex",
-	"gpt-5.2-codex":               "gpt-5.2-codex",
-	"gpt-5.2":                     "gpt-5.2",
-	"grok-4.1-fast":               "grok-4.1-fast",
-	"glm-5":                       "glm-5",
-	"kimi-k2.5":                   "kimi-k2.5",
+	"claude-sonnet-4-5":          "claude-sonnet-4-6",
+	"claude-sonnet-4-6":          "claude-sonnet-4-6",
+	"claude-sonnet-4-5-thinking": "claude-sonnet-4-5-thinking",
+	"claude-sonnet-4-6-thinking": "claude-sonnet-4-6",
+	"claude-opus-4-6":            "claude-opus-4-6",
+	"claude-opus-4-5":            "claude-opus-4-6",
+	"claude-opus-4-5-thinking":   "claude-opus-4-5-thinking",
+	"claude-opus-4-6-thinking":   "claude-opus-4-6",
+	"claude-haiku-4-5":           "claude-haiku-4-5",
+	"claude-sonnet-4-20250514":   "claude-sonnet-4-20250514",
+	"claude-3-7-sonnet-20250219": "claude-3-7-sonnet-20250219",
+	"gemini-3-flash":             "gemini-3-flash",
+	"gemini-3-pro":               "gemini-3-pro",
+	"gpt-5.3-codex":              "gpt-5.3-codex",
+	"gpt-5.2-codex":              "gpt-5.2-codex",
+	"gpt-5.2":                    "gpt-5.2",
+	"grok-4.1-fast":              "grok-4.1-fast",
+	"glm-5":                      "glm-5",
+	"kimi-k2.5":                  "kimi-k2.5",
 }
 
 const orchidsAIClientDefaultModel = "claude-sonnet-4-6"
@@ -91,6 +91,13 @@ type requestState struct {
 type fileWriterState struct {
 	path string
 	buf  strings.Builder
+}
+
+func cloneRawJSON(data []byte) json.RawMessage {
+	if len(data) == 0 {
+		return nil
+	}
+	return json.RawMessage(data)
 }
 
 func (c *Client) sendRequestWSAIClient(ctx context.Context, req upstream.UpstreamRequest, onMessage func(upstream.SSEMessage), logger *debug.Logger) error {
@@ -378,7 +385,7 @@ func (c *Client) handleOrchidsMessage(
 			return false
 		}
 		state.preferCodingAgent = true
-		onMessage(upstream.SSEMessage{Type: msgType, Event: msg, Raw: msg})
+		onMessage(upstream.SSEMessage{Type: msgType, Event: msg, Raw: msg, RawJSON: cloneRawJSON(rawData)})
 		return false
 
 	case EventCodingAgentTokens:
@@ -410,7 +417,7 @@ func (c *Client) handleOrchidsMessage(
 		return c.handleCompletionEvent(msgType, msg, state, onMessage)
 
 	case EventFS:
-		c.dispatchFSOperation(msg, onMessage, conn, fsWG, workdir)
+		c.dispatchFSOperation(msg, onMessage, conn, fsWG, workdir, rawData)
 		state.hasFSOps = true
 		return false
 
@@ -465,7 +472,7 @@ func (c *Client) handleOrchidsMessage(
 			}
 			state.activeWrites[path] = &fileWriterState{path: path}
 		}
-		onMessage(upstream.SSEMessage{Type: msgType, Event: msg})
+		onMessage(upstream.SSEMessage{Type: msgType, Event: msg, Raw: msg, RawJSON: cloneRawJSON(rawData)})
 		return false
 
 	case EventWriteChunk, EventEditChunk:
@@ -478,7 +485,7 @@ func (c *Client) handleOrchidsMessage(
 				w.buf.WriteString(text)
 			}
 		}
-		onMessage(upstream.SSEMessage{Type: msgType, Event: msg})
+		onMessage(upstream.SSEMessage{Type: msgType, Event: msg, Raw: msg, RawJSON: cloneRawJSON(rawData)})
 		return false
 
 	case EventWriteCompleted:
@@ -493,12 +500,12 @@ func (c *Client) handleOrchidsMessage(
 					"path":      path,
 					"content":   content,
 					"id":        fmt.Sprintf("stream_%d", time.Now().UnixMilli()),
-				}, onMessage, conn, fsWG, workdir)
+				}, onMessage, conn, fsWG, workdir, nil)
 				delete(state.activeWrites, path)
 				state.hasFSOps = true
 			}
 		}
-		onMessage(upstream.SSEMessage{Type: msgType, Event: msg, Raw: msg})
+		onMessage(upstream.SSEMessage{Type: msgType, Event: msg, Raw: msg, RawJSON: cloneRawJSON(rawData)})
 		return false
 
 	case EventEditCompleted, EventEditFileCompleted:
@@ -510,7 +517,7 @@ func (c *Client) handleOrchidsMessage(
 				delete(state.activeWrites, path)
 			}
 		}
-		onMessage(upstream.SSEMessage{Type: msgType, Event: msg, Raw: msg})
+		onMessage(upstream.SSEMessage{Type: msgType, Event: msg, Raw: msg, RawJSON: cloneRawJSON(rawData)})
 		return false
 
 	case EventModel:
@@ -652,8 +659,14 @@ func (c *Client) dispatchFSOperation(
 	conn *websocket.Conn,
 	wg *sync.WaitGroup,
 	workdir string,
+	rawData []byte,
 ) {
-	onMessage(upstream.SSEMessage{Type: "fs_operation", Event: msg})
+	onMessage(upstream.SSEMessage{
+		Type:    "fs_operation",
+		Event:   msg,
+		Raw:     msg,
+		RawJSON: cloneRawJSON(rawData),
+	})
 	wg.Add(1)
 	go func(m map[string]interface{}) {
 		defer wg.Done()
@@ -960,9 +973,6 @@ func extractMessageTextAIClient(content prompt.MessageContent) (string, []orchid
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n")), toolResults
 }
-
-// maxHistoryContentLen 单条 chatHistory 消息的最大字符数，防止上游超时或截断
-const maxHistoryContentLen = 8000
 
 func convertChatHistoryAIClient(messages []prompt.Message) ([]map[string]string, []orchidsToolResult) {
 	var history []map[string]string

@@ -2,7 +2,7 @@ package handler
 
 import (
 	"bytes"
-	"encoding/json"
+	"github.com/goccy/go-json"
 	"net/http"
 	"strings"
 	"testing"
@@ -24,10 +24,10 @@ func newFlushRecorder() *flushRecorder {
 	return &flushRecorder{header: make(http.Header), code: 200}
 }
 
-func (r *flushRecorder) Header() http.Header { return r.header }
+func (r *flushRecorder) Header() http.Header         { return r.header }
 func (r *flushRecorder) Write(b []byte) (int, error) { return r.buf.Write(b) }
-func (r *flushRecorder) WriteHeader(statusCode int) { r.code = statusCode }
-func (r *flushRecorder) Flush()                     {}
+func (r *flushRecorder) WriteHeader(statusCode int)  { r.code = statusCode }
+func (r *flushRecorder) Flush()                      {}
 
 func TestSanitizeToolInput_FieldMapping(t *testing.T) {
 	in := `{"path":"a.txt","content":"hi","overwrite":true}`
@@ -78,8 +78,19 @@ func TestNormalizeIntroKey(t *testing.T) {
 	if got := normalizeIntroKey("  Hello! How can I help you today? "); got != "intro:en:greet" {
 		t.Fatalf("unexpected: %q", got)
 	}
+	if got := normalizeIntroKey("Hi! 👋 What's up? How can I help today?"); got != "intro:en:greet" {
+		t.Fatalf("unexpected english variant: %q", got)
+	}
 	if got := normalizeIntroKey("你好，我能帮你什么"); got != "intro:zh:greet" {
 		t.Fatalf("unexpected: %q", got)
+	}
+}
+
+func TestCollapseDuplicatedIntroDelta(t *testing.T) {
+	in := "Hi! 👋 What's up? How can I help today?Hi! 👋 What's up? How can I help today?"
+	out := collapseDuplicatedIntroDelta(in)
+	if out != "Hi! 👋 What's up? How can I help today?" {
+		t.Fatalf("unexpected collapse result: %q", out)
 	}
 }
 

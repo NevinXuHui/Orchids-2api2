@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,10 +14,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goccy/go-json"
+
 	"orchids-api/internal/adapter"
 	"orchids-api/internal/audit"
 	"orchids-api/internal/config"
 	"orchids-api/internal/debug"
+	apperrors "orchids-api/internal/errors"
 	"orchids-api/internal/loadbalancer"
 	"orchids-api/internal/orchids"
 	"orchids-api/internal/prompt"
@@ -118,18 +120,6 @@ func (h *Handler) SetClientFactory(f ClientFactory) {
 	h.clientFactory = f
 }
 
-func (h *Handler) writeErrorResponse(w http.ResponseWriter, errType string, message string, code int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"type": "error",
-		"error": map[string]string{
-			"type":    errType,
-			"message": message,
-		},
-	})
-}
-
 func (h *Handler) computeRequestHash(r *http.Request, body []byte) string {
 	hasher := sha256.New()
 	hasher.Write([]byte(r.URL.Path))
@@ -139,6 +129,45 @@ func (h *Handler) computeRequestHash(r *http.Request, body []byte) string {
 	}
 	hasher.Write([]byte{0})
 	hasher.Write(body)
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func (h *Handler) computeSemanticRequestHash(r *http.Request, req ClaudeRequest) string {
+	userText := normalizeTopicText(extractUserText(req.Messages))
+	if userText == "" {
+		return ""
+	}
+	if len(userText) > 4096 {
+		userText = userText[:4096]
+	}
+
+	mode := "chat"
+	if isTopicClassifierRequest(req) {
+		mode = "topic_classifier"
+	} else if ok, _ := isCommandPrefixRequest(req); ok {
+		mode = "command_prefix"
+	}
+
+	hasher := sha256.New()
+	hasher.Write([]byte(r.URL.Path))
+	hasher.Write([]byte{0})
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		hasher.Write([]byte(auth))
+	}
+	hasher.Write([]byte{0})
+	hasher.Write([]byte(strings.ToLower(strings.TrimSpace(req.Model))))
+	hasher.Write([]byte{0})
+	hasher.Write([]byte(strings.ToLower(strings.TrimSpace(conversationKeyForRequest(r, req)))))
+	hasher.Write([]byte{0})
+	hasher.Write([]byte(mode))
+	hasher.Write([]byte{0})
+	if req.Stream {
+		hasher.Write([]byte{1})
+	} else {
+		hasher.Write([]byte{0})
+	}
+	hasher.Write([]byte{0})
+	hasher.Write([]byte(userText))
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
@@ -155,19 +184,35 @@ func (h *Handler) writeDuplicateResponse(w http.ResponseWriter, req ClaudeReques
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		msgStart, _ := json.Marshal(map[string]interface{}{
-			"type": "message_start",
-			"message": map[string]interface{}{
-				"id":      "dup",
-				"type":    "message",
-				"role":    "assistant",
-				"content": []interface{}{},
-				"model":   req.Model,
+
+		// Zero-allocation response construction
+		msgStart, _ := json.Marshal(struct {
+			Type    string `json:"type"`
+			Message struct {
+				ID      string        `json:"id"`
+				Type    string        `json:"type"`
+				Role    string        `json:"role"`
+				Content []interface{} `json:"content"`
+				Model   string        `json:"model"`
+			} `json:"message"`
+		}{
+			Type: "message_start",
+			Message: struct {
+				ID      string        `json:"id"`
+				Type    string        `json:"type"`
+				Role    string        `json:"role"`
+				Content []interface{} `json:"content"`
+				Model   string        `json:"model"`
+			}{
+				ID:      "dup",
+				Type:    "message",
+				Role:    "assistant",
+				Content: []interface{}{},
+				Model:   req.Model,
 			},
 		})
 		fmt.Fprintf(w, "event: message_start\ndata: %s\n\n", msgStart)
-		msgStop, _ := json.Marshal(map[string]string{"type": "message_stop"})
-		fmt.Fprintf(w, "event: message_stop\ndata: %s\n\n", msgStop)
+		fmt.Fprintf(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
@@ -175,12 +220,18 @@ func (h *Handler) writeDuplicateResponse(w http.ResponseWriter, req ClaudeReques
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(map[string]interface{}{
-		"type":     "duplicate_request",
-		"deduped":  true,
-		"message":  "duplicate request suppressed",
-		"model":    req.Model,
-		"streamed": false,
+	if err := json.NewEncoder(w).Encode(struct {
+		Type     string `json:"type"`
+		Deduped  bool   `json:"deduped"`
+		Message  string `json:"message"`
+		Model    string `json:"model"`
+		Streamed bool   `json:"streamed"`
+	}{
+		Type:     "duplicate_request",
+		Deduped:  true,
+		Message:  "duplicate request suppressed",
+		Model:    req.Model,
+		Streamed: false,
 	}); err != nil {
 		slog.Error("Failed to write duplicate response", "error", err)
 	}
@@ -196,25 +247,19 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			slog.Error("Panic in HandleMessages", "error", err, "stack", stack)
 			if streamingStarted {
 				// Headers already sent — write an SSE error event instead of HTTP error
-				errData, _ := json.Marshal(map[string]interface{}{
-					"type": "error",
-					"error": map[string]interface{}{
-						"type":    "server_error",
-						"message": "Internal Server Error",
-					},
-				})
-				fmt.Fprintf(w, "event: error\ndata: %s\n\n", errData)
+				// Pre-compiled zero-allocation string
+				fmt.Fprintf(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"message\":\"Internal Server Error\"}}\n\n")
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
 			} else {
-				h.writeErrorResponse(w, "server_error", "Internal Server Error", http.StatusInternalServerError)
+				apperrors.New("server_error", "Internal Server Error", http.StatusInternalServerError).WriteResponse(w)
 			}
 		}
 	}()
 
 	if r.Method != http.MethodPost {
-		h.writeErrorResponse(w, "invalid_request_error", "Method not allowed", http.StatusMethodNotAllowed)
+		apperrors.New("invalid_request_error", "Method not allowed", http.StatusMethodNotAllowed).WriteResponse(w)
 		return
 	}
 
@@ -227,15 +272,15 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		if maxRequestBytes > 0 {
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
-				h.writeErrorResponse(w, "invalid_request_error", "Request body too large", http.StatusRequestEntityTooLarge)
+				apperrors.New("invalid_request_error", "Request body too large", http.StatusRequestEntityTooLarge).WriteResponse(w)
 				return
 			}
 		}
-		h.writeErrorResponse(w, "invalid_request_error", "Invalid request body", http.StatusBadRequest)
+		apperrors.New("invalid_request_error", "Invalid request body", http.StatusBadRequest).WriteResponse(w)
 		return
 	}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		h.writeErrorResponse(w, "invalid_request_error", "Invalid request body", http.StatusBadRequest)
+		apperrors.New("invalid_request_error", "Invalid request body", http.StatusBadRequest).WriteResponse(w)
 		return
 	}
 
@@ -247,18 +292,47 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	logger.LogIncomingRequest(req)
 
 	reqHash := h.computeRequestHash(r, bodyBytes)
-	slog.Debug("Request fingerprint", "hash", reqHash, "path", r.URL.Path, "content_length", len(bodyBytes), "retry", r.Header.Get("X-Stainless-Retry-Count"))
-	if dup, inFlight := h.registerRequest(reqHash); dup {
+	semanticHash := h.computeSemanticRequestHash(r, req)
+	slog.Debug("Request fingerprint", "hash", reqHash, "semantic_hash", semanticHash, "path", r.URL.Path, "content_length", len(bodyBytes), "retry", r.Header.Get("X-Stainless-Retry-Count"))
+
+	exactKey := "exact:" + reqHash
+	registeredKeys := []string{}
+	if dup, inFlight := h.registerRequest(exactKey); dup {
 		slog.Warn("Duplicate request suppressed", "hash", reqHash, "in_flight", inFlight, "path", r.URL.Path, "user_agent", r.UserAgent())
 		logger.LogEarlyExit("duplicate_request", map[string]interface{}{
-			"hash":      reqHash,
+			"hash":      exactKey,
 			"in_flight": inFlight,
 			"path":      r.URL.Path,
+			"kind":      "exact",
 		})
 		h.writeDuplicateResponse(w, req)
 		return
 	}
-	defer h.finishRequest(reqHash)
+	registeredKeys = append(registeredKeys, exactKey)
+
+	if semanticHash != "" {
+		semanticKey := "semantic:" + semanticHash
+		if dup, inFlight := h.registerRequest(semanticKey); dup {
+			for i := len(registeredKeys) - 1; i >= 0; i-- {
+				h.finishRequest(registeredKeys[i])
+			}
+			slog.Warn("Semantic duplicate request suppressed", "hash", semanticHash, "in_flight", inFlight, "path", r.URL.Path, "user_agent", r.UserAgent())
+			logger.LogEarlyExit("duplicate_request", map[string]interface{}{
+				"hash":      semanticKey,
+				"in_flight": inFlight,
+				"path":      r.URL.Path,
+				"kind":      "semantic",
+			})
+			h.writeDuplicateResponse(w, req)
+			return
+		}
+		registeredKeys = append(registeredKeys, semanticKey)
+	}
+	defer func() {
+		for i := len(registeredKeys) - 1; i >= 0; i-- {
+			h.finishRequest(registeredKeys[i])
+		}
+	}()
 
 	// ...
 	if ok, command := isCommandPrefixRequest(req); ok {
@@ -296,7 +370,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	forcedChannel := channelFromPath(r.URL.Path)
 	if err := h.validateModelAvailability(r.Context(), req.Model, forcedChannel); err != nil {
-		h.writeErrorResponse(w, "invalid_request_error", err.Error(), http.StatusBadRequest)
+		apperrors.New("invalid_request_error", err.Error(), http.StatusBadRequest).WriteResponse(w)
 		return
 	}
 	effectiveWorkdir, prevWorkdir, workdirChanged := h.resolveWorkdir(r, req, conversationKey)
@@ -321,7 +395,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			"model":   req.Model,
 			"channel": forcedChannel,
 		})
-		h.writeErrorResponse(w, "overloaded_error", err.Error(), http.StatusServiceUnavailable)
+		apperrors.New("overloaded_error", err.Error(), http.StatusServiceUnavailable).WriteResponse(w)
 		return
 	}
 	slog.Debug("Checkpoint: selectAccount success")
@@ -386,15 +460,6 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// 构建 prompt（V2 Markdown 格式）
 	startBuild := time.Now()
-
-	summaryKey := conversationKey
-	if strings.TrimSpace(effectiveWorkdir) != "" {
-		summaryKey = conversationKey + "|" + strings.TrimSpace(effectiveWorkdir)
-	}
-	// NOTE: AIClient mode handles its own context budgeting; legacy PromptOptions are deprecated.
-	_ = summaryKey
-	_ = effectiveWorkdir
-
 	slog.Debug("Starting prompt build...", "conversation_id", conversationKey)
 	// Orchids: always use AIClient mode (other implementations are deprecated/removed).
 	isOrchidsAIClient := false
@@ -429,12 +494,12 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		streamingStarted = true
 
 		if _, ok := w.(http.Flusher); !ok {
-			h.writeErrorResponse(w, "api_error", "Streaming not supported by underlying connection", http.StatusInternalServerError)
+			apperrors.New("api_error", "Streaming not supported by underlying connection", http.StatusInternalServerError).WriteResponse(w)
 			return
 		}
+		streamingStarted = true
 	} else {
 		w.Header().Set("Content-Type", "application/json")
 	}
@@ -575,14 +640,15 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			NoThinking:    noThinking,
 			ChatSessionID: chatSessionID,
 		}
+		var attempt int
 		for {
-			if retriesRemaining < maxRetries {
+			if attempt > 0 {
 				// 非首次尝试：向客户端发送重试提示，避免前一次不完整内容造成混淆
 				sh.emitTextBlock("\n\n[Retrying request...]\n\n")
 			}
 			sh.resetRoundState()
 			var err error
-			slog.Debug("Calling Upstream Client...", "attempt", maxRetries-retriesRemaining+1)
+			slog.Debug("Calling Upstream Client...", "attempt", attempt+1)
 
 			slog.Info("Interface check", "type", fmt.Sprintf("%T", apiClient))
 			if sender, ok := apiClient.(UpstreamPayloadClient); ok {
@@ -730,13 +796,13 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if retryDelay > 0 {
-				attempt := maxRetries - retriesRemaining + 1
-				delay := computeRetryDelay(retryDelay, attempt, errClass.Category)
+				delay := computeRetryDelay(retryDelay, attempt+1, errClass.Category)
 				if delay > 0 && !util.SleepWithContext(r.Context(), delay) {
 					sh.finishResponse("end_turn")
 					return
 				}
 			}
+			attempt++
 		}
 	}
 

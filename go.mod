@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.36.1
+	github.com/goccy/go-json v0.10.5
 	github.com/gorilla/websocket v1.5.3
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/prometheus/client_golang v1.23.2

@@ -8,16 +8,18 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/goccy/go-json"
 )
 
 type session struct {
@@ -78,7 +80,24 @@ func getSession(accountID int64, refreshToken string) *session {
 
 	key := sessionKey(accountID, refreshToken)
 
-	// Use LoadOrStore to atomically check-and-insert, preventing race conditions
+	// Optimistic check to avoid allocating cookiejar & struct if cached
+	if val, ok := sessionCache.Load(key); ok {
+		sess := val.(*session)
+		sess.mu.Lock()
+		sess.lastUsed = time.Now()
+		if refreshToken != "" && sess.refreshToken != refreshToken {
+			// refresh_token 变更时更新会话，避免旧令牌导致认证异常
+			sess.refreshToken = refreshToken
+			sess.jwt = ""
+			sess.expiresAt = time.Time{}
+			sess.loggedIn = false
+			sess.lastLogin = time.Time{}
+		}
+		sess.mu.Unlock()
+		return sess
+	}
+
+	// Session not found, allocate fully and try inserting
 	jar, _ := cookiejar.New(nil)
 	newSess := &session{
 		refreshToken:  refreshToken,
@@ -93,11 +112,10 @@ func getSession(accountID int64, refreshToken string) *session {
 	sess := val.(*session)
 
 	if loaded {
-		// Existing session found — update refresh token if changed
+		// Another goroutine inserted it between our Load and LoadOrStore
 		sess.mu.Lock()
 		sess.lastUsed = time.Now()
 		if refreshToken != "" && sess.refreshToken != refreshToken {
-			// refresh_token 变更时更新会话，避免旧令牌导致认证异常
 			sess.refreshToken = refreshToken
 			sess.jwt = ""
 			sess.expiresAt = time.Time{}
@@ -151,46 +169,43 @@ func (s *session) tokenValid() bool {
 }
 
 func (s *session) ensureToken(ctx context.Context, httpClient *http.Client, cid string) error {
-	s.mu.Lock()
-	if s.tokenValid() {
-		s.mu.Unlock()
-		return nil
-	}
-	// If another goroutine is already refreshing, wait for it
-	if s.refreshing {
-		ch := s.refreshDone
-		s.mu.Unlock()
-		if ch != nil {
-			select {
-			case <-ch:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		// After waiting, check if token is now valid
+	const maxRefreshAttempts = 3
+	for attempt := 0; attempt < maxRefreshAttempts; attempt++ {
 		s.mu.Lock()
-		valid := s.tokenValid()
-		s.mu.Unlock()
-		if valid {
+		if s.tokenValid() {
+			s.mu.Unlock()
 			return nil
 		}
-		// If still invalid, fall through to try refresh ourselves
-		return s.ensureToken(ctx, httpClient, cid)
+		// If another goroutine is already refreshing, wait for it
+		if s.refreshing {
+			ch := s.refreshDone
+			s.mu.Unlock()
+			if ch != nil {
+				select {
+				case <-ch:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			// After waiting, loop to re-check token
+			continue
+		}
+		// Mark that we are refreshing
+		s.refreshing = true
+		s.refreshDone = make(chan struct{})
+		s.mu.Unlock()
+
+		err := s.refreshTokenRequest(ctx, httpClient, cid)
+
+		s.mu.Lock()
+		s.refreshing = false
+		close(s.refreshDone)
+		s.refreshDone = nil
+		s.mu.Unlock()
+
+		return err
 	}
-	// Mark that we are refreshing
-	s.refreshing = true
-	s.refreshDone = make(chan struct{})
-	s.mu.Unlock()
-
-	err := s.refreshTokenRequest(ctx, httpClient, cid)
-
-	s.mu.Lock()
-	s.refreshing = false
-	close(s.refreshDone)
-	s.refreshDone = nil
-	s.mu.Unlock()
-
-	return err
+	return fmt.Errorf("ensureToken: max refresh attempts (%d) exceeded", maxRefreshAttempts)
 }
 
 func isTransientNetworkError(err error) bool {
@@ -256,8 +271,11 @@ func (s *session) doRefreshTokenRequest(ctx context.Context, httpClient *http.Cl
 	req.Header.Set("accept", "*/*")
 	req.Header.Set("accept-encoding", "gzip")
 
+
+
 	resp, err := httpClient.Do(req)
 	if err != nil {
+
 		slog.Warn("Warp AI: Refresh request failed", "cid", cid, "error", err)
 		return err
 	}
@@ -277,6 +295,8 @@ func (s *session) doRefreshTokenRequest(ctx context.Context, httpClient *http.Cl
 		slog.Warn("Warp refresh body read failed", "error", err)
 		return err
 	}
+
+
 
 	if resp.StatusCode != http.StatusOK {
 		retryAfter := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
@@ -406,8 +426,11 @@ func (s *session) doLogin(ctx context.Context, httpClient *http.Client, cid, jwt
 	re.Header.Set("accept-encoding", "gzip")
 	re.Header.Set("content-length", "0")
 
+
+
 	resp, err := httpClient.Do(re)
 	if err != nil {
+
 		slog.Warn("Warp AI: Login request failed", "cid", cid, "error", err)
 		return err
 	}
@@ -427,6 +450,8 @@ func (s *session) doLogin(ctx context.Context, httpClient *http.Client, cid, jwt
 		slog.Warn("Warp login body read failed", "error", err)
 		return err
 	}
+
+
 
 	if resp.StatusCode != http.StatusNoContent {
 		slog.Warn("Warp AI: Login failed", "cid", cid, "status", resp.StatusCode, "body", string(body))

@@ -1,8 +1,10 @@
 package grok
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeSSOToken(t *testing.T) {
@@ -13,6 +15,7 @@ func TestNormalizeSSOToken(t *testing.T) {
 		{in: "abc", want: "abc"},
 		{in: "sso=abc123", want: "abc123"},
 		{in: "foo=1; sso=abc123; bar=2", want: "abc123"},
+		{in: "notsso=abc123", want: "notsso=abc123"},
 	}
 	for _, tt := range tests {
 		got := NormalizeSSOToken(tt.in)
@@ -64,6 +67,28 @@ func TestExtractMessageAndAttachments(t *testing.T) {
 	}
 }
 
+func TestValidateChatMessages_AcceptsCaseInsensitiveRoleAndType(t *testing.T) {
+	messages := []ChatMessage{
+		{
+			Role: "User",
+			Content: []interface{}{
+				map[string]interface{}{"type": "Text", "text": "hello"},
+				map[string]interface{}{"type": "Image_URL", "image_url": map[string]interface{}{"url": "https://a/b.png"}},
+			},
+		},
+		{
+			Role: "ASSISTANT",
+			Content: []interface{}{
+				map[string]interface{}{"type": "TEXT", "text": "ok"},
+			},
+		},
+	}
+
+	if err := validateChatMessages(messages); err != nil {
+		t.Fatalf("validateChatMessages() error = %v", err)
+	}
+}
+
 func TestResolveAspectRatio(t *testing.T) {
 	if got := resolveAspectRatio("1024x1024"); got != "1:1" {
 		t.Fatalf("resolveAspectRatio(1024x1024)=%q want=1:1", got)
@@ -95,6 +120,49 @@ func TestExtractLastUserText(t *testing.T) {
 	}
 }
 
+func TestParseUpstreamLines_CollectAndSkip(t *testing.T) {
+	raw := strings.Join([]string{
+		`{"result":{"response":{"token":"hello"}}}`,
+		`{"result":{"other":1}}`,
+		`{"other":2}`,
+		`{"result":{"response":{"token":"world"}}}`,
+	}, "")
+
+	got := make([]string, 0, 2)
+	err := parseUpstreamLines(strings.NewReader(raw), func(line map[string]interface{}) error {
+		token, _ := line["token"].(string)
+		got = append(got, token)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("parseUpstreamLines() error: %v", err)
+	}
+	if len(got) != 2 || got[0] != "hello" || got[1] != "world" {
+		t.Fatalf("unexpected tokens: %v", got)
+	}
+}
+
+func TestParseUpstreamLines_CallbackError(t *testing.T) {
+	expectErr := errors.New("stop")
+	raw := `{"result":{"response":{"token":"hello"}}}`
+	err := parseUpstreamLines(strings.NewReader(raw), func(line map[string]interface{}) error {
+		return expectErr
+	})
+	if !errors.Is(err, expectErr) {
+		t.Fatalf("parseUpstreamLines error=%v want=%v", err, expectErr)
+	}
+}
+
+func TestParseUpstreamLines_InvalidJSON(t *testing.T) {
+	raw := `{"result":{"response":{"token":"hello"}}`
+	err := parseUpstreamLines(strings.NewReader(raw), func(line map[string]interface{}) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("expected invalid json error")
+	}
+}
+
 func TestParseRateLimitPayload_AcceptsQueriesFields(t *testing.T) {
 	payload := map[string]interface{}{
 		"maxQueries":       140,
@@ -109,6 +177,110 @@ func TestParseRateLimitPayload_AcceptsQueriesFields(t *testing.T) {
 	}
 	if info.Remaining != 23 {
 		t.Fatalf("remaining=%d want=23", info.Remaining)
+	}
+}
+
+func TestParseRateLimitPayload_SkipsNonNumericMatchedField(t *testing.T) {
+	payload := map[string]interface{}{
+		"quota": map[string]interface{}{
+			"kind": "daily",
+		},
+		"limits": map[string]interface{}{
+			"maxQueries":       140,
+			"remainingQueries": 23,
+		},
+	}
+
+	for i := 0; i < 200; i++ {
+		info := parseRateLimitPayload(payload)
+		if info == nil {
+			t.Fatalf("parseRateLimitPayload returned nil at iter=%d", i)
+		}
+		if info.Limit != 140 {
+			t.Fatalf("limit=%d want=140 iter=%d", info.Limit, i)
+		}
+		if info.Remaining != 23 {
+			t.Fatalf("remaining=%d want=23 iter=%d", info.Remaining, i)
+		}
+	}
+}
+
+func TestParseRateLimitPayload_CollectsNestedResetAndNumbers(t *testing.T) {
+	rawReset := "2026-03-05T19:00:00Z"
+	wantReset, _ := time.Parse(time.RFC3339, rawReset)
+	payload := map[string]interface{}{
+		"quota_limit": "not-a-number",
+		"meta": map[string]interface{}{
+			"limits": map[string]interface{}{
+				"maxQueries":       140,
+				"remainingQueries": "23",
+			},
+			"resetAt": rawReset,
+		},
+	}
+
+	info := parseRateLimitPayload(payload)
+	if info == nil {
+		t.Fatalf("parseRateLimitPayload returned nil")
+	}
+	if info.Limit != 140 {
+		t.Fatalf("limit=%d want=140", info.Limit)
+	}
+	if info.Remaining != 23 {
+		t.Fatalf("remaining=%d want=23", info.Remaining)
+	}
+	if !info.ResetAt.Equal(wantReset) {
+		t.Fatalf("reset=%v want=%v", info.ResetAt, wantReset)
+	}
+}
+
+func TestParseRateLimitPayload_SkipsInvalidResetAndFindsNested(t *testing.T) {
+	const resetMS int64 = 1730000000000
+	wantReset := time.UnixMilli(resetMS)
+	payload := map[string]interface{}{
+		"reset": "invalid-time",
+		"meta": map[string]interface{}{
+			"reset_at_ms": resetMS,
+		},
+	}
+
+	info := parseRateLimitPayload(payload)
+	if info == nil {
+		t.Fatalf("parseRateLimitPayload returned nil")
+	}
+	if !info.ResetAt.Equal(wantReset) {
+		t.Fatalf("reset=%v want=%v", info.ResetAt, wantReset)
+	}
+}
+
+func TestParseRateLimitValue_ComplexFormats(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int64
+	}{
+		{in: "100;w=3600", want: 100},
+		{in: "23/50", want: 23},
+		{in: "remaining=42", want: 42},
+		{in: "  7.9 requests", want: 7},
+	}
+
+	for _, tt := range tests {
+		got, ok := parseRateLimitValue(tt.in)
+		if !ok {
+			t.Fatalf("parseRateLimitValue(%q) not parsed", tt.in)
+		}
+		if got != tt.want {
+			t.Fatalf("parseRateLimitValue(%q)=%d want=%d", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestParseRateLimitReset_RFC3339(t *testing.T) {
+	raw := "2026-03-05T19:00:00Z"
+	got := parseRateLimitReset(raw)
+	want, _ := time.Parse(time.RFC3339, raw)
+	if !got.Equal(want) {
+		t.Fatalf("parseRateLimitReset(%q)=%v want=%v", raw, got, want)
 	}
 }
 
@@ -127,5 +299,73 @@ func TestStripToolAndRenderMarkup_ExtractsToolCardText(t *testing.T) {
 	}
 	if !strings.Contains(out, "结论") {
 		t.Fatalf("final content missing, got=%q", out)
+	}
+}
+
+func BenchmarkExtractToolUsageCardText(b *testing.B) {
+	raw := `<xai:tool_usage_card><xai:tool_name>web_search</xai:tool_name><xai:tool_args>{"query":"特朗普头像","q":"特朗普头像"}</xai:tool_args></xai:tool_usage_card>`
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = extractToolUsageCardText(raw)
+	}
+}
+
+func BenchmarkStripToolAndRenderMarkup(b *testing.B) {
+	in := strings.Join([]string{
+		`<xai:tool_usage_card><xai:tool_name>web_search</xai:tool_name><xai:tool_args>{"query":"特朗普头像"}</xai:tool_args></xai:tool_usage_card>`,
+		`<xai:tool_usage_card><xai:tool_name>chatroom_send</xai:tool_name><xai:tool_args><![CDATA[{"message":"分析结果"}]]></xai:tool_args></xai:tool_usage_card>`,
+		`<grok:render card_id="x">ignore</grok:render>`,
+		`结论`,
+	}, "\n")
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = stripToolAndRenderMarkup(in)
+	}
+}
+
+func BenchmarkParseRateLimitPayload_Nested(b *testing.B) {
+	payload := map[string]interface{}{
+		"quota": map[string]interface{}{
+			"kind": "daily",
+		},
+		"limits": map[string]interface{}{
+			"maxQueries":       140,
+			"remainingQueries": 23,
+			"resetAt":          "2026-03-05T19:00:00Z",
+		},
+		"meta": []interface{}{
+			map[string]interface{}{"k": "v"},
+			map[string]interface{}{"unused": 1},
+		},
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = parseRateLimitPayload(payload)
+	}
+}
+
+func BenchmarkParseUpstreamLines(b *testing.B) {
+	raw := strings.Join([]string{
+		`{"result":{"response":{"token":"hello","progress":10}}}`,
+		`{"result":{"response":{"token":"world","progress":90}}}`,
+		`{"result":{"other":1}}`,
+		`{"other":2}`,
+	}, "")
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := parseUpstreamLines(strings.NewReader(raw), func(line map[string]interface{}) error {
+			_, _ = line["token"].(string)
+			return nil
+		}); err != nil {
+			b.Fatalf("parseUpstreamLines error: %v", err)
+		}
+	}
+}
+
+func BenchmarkParseRateLimitValue_CompoundHeader(b *testing.B) {
+	raw := "100;w=3600"
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = parseRateLimitValue(raw)
 	}
 }

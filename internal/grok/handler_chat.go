@@ -2,8 +2,8 @@ package grok
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"github.com/goccy/go-json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -31,6 +31,21 @@ func detectPublicBaseURL(r *http.Request) string {
 		return ""
 	}
 	return proto + "://" + host
+}
+
+func isThinkingResponse(resp map[string]interface{}) bool {
+	if resp == nil {
+		return false
+	}
+	raw, ok := resp["isThinking"]
+	if !ok {
+		return false
+	}
+	val, err := parseLooseBoolAnyForField(raw, "isThinking")
+	if err != nil {
+		return false
+	}
+	return val
 }
 
 func (h *Handler) defaultChatStream() bool {
@@ -228,10 +243,10 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	hasAttachments := len(attachments) > 0
 	if req.Stream {
-		h.streamChat(w, req.Model, spec, sess.token, publicBase, hasAttachments, text, resp.Body)
+		h.streamChat(w, req.Model, spec, sess.token, publicBase, hasAttachments, resp.Body)
 		return
 	}
-	h.collectChat(w, req.Model, spec, sess.token, publicBase, hasAttachments, text, resp.Body)
+	h.collectChat(w, req.Model, spec, sess.token, publicBase, resp.Body)
 }
 
 func (h *Handler) buildChatPayload(
@@ -422,6 +437,52 @@ type streamMarkupFilter struct {
 	inRender bool
 }
 
+const (
+	streamToolStartTag   = "xai:tool_usage_card"
+	streamToolEndTag     = "</xai:tool_usage_card>"
+	streamRenderStartTag = "<grok:render"
+	streamRenderEndTag   = "</grok:render>"
+)
+
+func asciiLowerByte(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if asciiLowerByte(a[i]) != asciiLowerByte(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func indexFoldASCII(s, sub string) int {
+	if sub == "" {
+		return 0
+	}
+	n := len(sub)
+	if len(s) < n {
+		return -1
+	}
+	first := asciiLowerByte(sub[0])
+	for i := 0; i <= len(s)-n; i++ {
+		if asciiLowerByte(s[i]) != first {
+			continue
+		}
+		if equalFoldASCII(s[i:i+n], sub) {
+			return i
+		}
+	}
+	return -1
+}
+
 // Streaming sanitizer/tokenizer.
 // Goal: never leak tool/render markup, never corrupt UTF-8, and keep streaming responsive.
 func (f *streamMarkupFilter) feed(chunk string) string {
@@ -434,46 +495,47 @@ func (f *streamMarkupFilter) feed(chunk string) string {
 		f.pending = f.pending[len(f.pending)-64*1024:]
 	}
 
-	const toolStart = "xai:tool_usage_card"
-	const toolEnd = "</xai:tool_usage_card>"
-	const renderStart = "<grok:render"
-	const renderEnd = "</grok:render>"
-
 	var out strings.Builder
+	endsWithNewline := false
+	writeOut := func(s string) {
+		if s == "" {
+			return
+		}
+		out.WriteString(s)
+		endsWithNewline = s[len(s)-1] == '\n'
+	}
 
 	for {
-		lower := strings.ToLower(f.pending)
-
 		if f.inTool {
-			end := strings.Index(lower, toolEnd)
+			end := indexFoldASCII(f.pending, streamToolEndTag)
 			if end < 0 {
 				// wait for more data
 				break
 			}
-			raw := f.pending[:end+len(toolEnd)]
+			raw := f.pending[:end+len(streamToolEndTag)]
 			if line := extractToolUsageCardText(raw); line != "" {
-				if out.Len() > 0 && !strings.HasSuffix(out.String(), "\n") {
-					out.WriteString("\n")
+				if out.Len() > 0 && !endsWithNewline {
+					writeOut("\n")
 				}
-				out.WriteString(line)
-				out.WriteString("\n")
+				writeOut(line)
+				writeOut("\n")
 			}
-			f.pending = f.pending[end+len(toolEnd):]
+			f.pending = f.pending[end+len(streamToolEndTag):]
 			f.inTool = false
 			continue
 		}
 		if f.inRender {
-			end := strings.Index(lower, renderEnd)
+			end := indexFoldASCII(f.pending, streamRenderEndTag)
 			if end < 0 {
 				break
 			}
-			f.pending = f.pending[end+len(renderEnd):]
+			f.pending = f.pending[end+len(streamRenderEndTag):]
 			f.inRender = false
 			continue
 		}
 
-		idxTool := strings.Index(lower, toolStart)
-		idxRender := strings.Index(lower, renderStart)
+		idxTool := indexFoldASCII(f.pending, streamToolStartTag)
+		idxRender := indexFoldASCII(f.pending, streamRenderStartTag)
 		idx := -1
 		kind := ""
 		if idxTool >= 0 {
@@ -494,7 +556,7 @@ func (f *streamMarkupFilter) feed(chunk string) string {
 			safe := validUTF8Prefix(f.pending[:len(f.pending)-keep])
 			safe = stripLeadingAngleNoise(sanitizeText(safe))
 			if safe != "" {
-				out.WriteString(safe)
+				writeOut(safe)
 			}
 			f.pending = f.pending[len(f.pending)-keep:]
 			break
@@ -504,7 +566,7 @@ func (f *streamMarkupFilter) feed(chunk string) string {
 		prefix := validUTF8Prefix(f.pending[:idx])
 		prefix = stripLeadingAngleNoise(sanitizeText(prefix))
 		if prefix != "" {
-			out.WriteString(prefix)
+			writeOut(prefix)
 		}
 		f.pending = f.pending[idx:]
 		if kind == "tool" {
@@ -547,9 +609,192 @@ func validUTF8Prefix(s string) string {
 	return ""
 }
 
+func collapseDuplicatedLongChunk(text string) string {
+	original := strings.TrimSpace(stripZeroWidth(text))
+	if original == "" {
+		return text
+	}
+	current := original
+	for {
+		next, ok := collapseDuplicatedLongChunkOnce(current)
+		if !ok {
+			break
+		}
+		current = next
+	}
+	if current == original {
+		return text
+	}
+	return current
+}
+
+func collapseDuplicatedLongChunkOnce(trimmed string) (string, bool) {
+	runes := []rune(trimmed)
+	if len(runes) < 24 {
+		return "", false
+	}
+
+	for sep := 0; sep <= 3; sep++ {
+		total := len(runes) - sep
+		if total <= 0 || total%2 != 0 {
+			continue
+		}
+		half := total / 2
+		first := strings.TrimSpace(stripZeroWidth(string(runes[:half])))
+		second := strings.TrimSpace(stripZeroWidth(string(runes[half+sep:])))
+		mid := strings.TrimSpace(stripZeroWidth(string(runes[half : half+sep])))
+		if first == "" || second == "" || first != second || mid != "" {
+			continue
+		}
+		if utf8.RuneCountInString(first) < 12 {
+			return "", false
+		}
+		return first, true
+	}
+	return "", false
+}
+
+func stripZeroWidth(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\u200b', '\u200c', '\u200d', '\ufeff':
+			return -1
+		default:
+			return r
+		}
+	}, s)
+}
+
+func sanitizeUpstreamText(raw string) string {
+	return stripLeadingAngleNoise(sanitizeText(stripToolAndRenderMarkup(raw)))
+}
+
+const streamImageRefTailKeep = 1024
+
+type streamTextImageRefCollector struct {
+	tail      string
+	urls      []string
+	assets    []string
+	seenURLs  map[string]struct{}
+	seenAsset map[string]struct{}
+}
+
+func newStreamTextImageRefCollector() *streamTextImageRefCollector {
+	return &streamTextImageRefCollector{
+		urls:      make([]string, 0, 8),
+		assets:    make([]string, 0, 8),
+		seenURLs:  map[string]struct{}{},
+		seenAsset: map[string]struct{}{},
+	}
+}
+
+func streamRefMaybePresent(s string) bool {
+	if s == "" {
+		return false
+	}
+	return strings.Contains(s, "http://") ||
+		strings.Contains(s, "https://") ||
+		strings.Contains(s, "assets.grok.com") ||
+		strings.Contains(s, "/generated/") ||
+		strings.Contains(s, "users/") ||
+		strings.Contains(s, "user/") ||
+		strings.Contains(s, ".png") ||
+		strings.Contains(s, ".jpg") ||
+		strings.Contains(s, ".jpeg") ||
+		strings.Contains(s, ".webp") ||
+		strings.Contains(s, ".gif")
+}
+
+func keepLastBytes(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	return s[len(s)-maxLen:]
+}
+
+func (c *streamTextImageRefCollector) feed(raw string) {
+	if c == nil || strings.TrimSpace(raw) == "" {
+		return
+	}
+	scan := raw
+	if c.tail != "" {
+		scan = c.tail + raw
+	}
+	if streamRefMaybePresent(scan) {
+		for _, u := range extractImageURLsFromText(scan) {
+			u = strings.TrimSpace(u)
+			if u == "" {
+				continue
+			}
+			if _, ok := c.seenURLs[u]; ok {
+				continue
+			}
+			c.seenURLs[u] = struct{}{}
+			c.urls = append(c.urls, u)
+		}
+		for _, p := range extractGrokAssetPathsFromText(scan) {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if _, ok := c.seenAsset[p]; ok {
+				continue
+			}
+			c.seenAsset[p] = struct{}{}
+			c.assets = append(c.assets, p)
+		}
+	}
+	c.tail = keepLastBytes(scan, streamImageRefTailKeep)
+}
+
+func (c *streamTextImageRefCollector) emit(emitURL func(string)) {
+	if c == nil || emitURL == nil {
+		return
+	}
+	for _, u := range c.urls {
+		emitURL(u)
+	}
+	for _, p := range c.assets {
+		emitURL("https://assets.grok.com/" + strings.TrimPrefix(p, "/"))
+	}
+}
+
+func forEachImageCandidateFromValue(value interface{}, includeStructured bool, includeAssetLike bool, assetLimit int, emitURL func(string)) {
+	if emitURL == nil {
+		return
+	}
+	if includeStructured {
+		for _, u := range extractImageURLs(value) {
+			emitURL(u)
+		}
+	}
+	for _, u := range extractRenderableImageLinks(value) {
+		emitURL(u)
+	}
+	if !includeAssetLike {
+		return
+	}
+	for _, p := range collectAssetLikeStrings(value, assetLimit) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if isLikelyImageURL(p) {
+			emitURL(p)
+			continue
+		}
+		if isLikelyImageAssetPath(p) {
+			emitURL("https://assets.grok.com/" + strings.TrimPrefix(p, "/"))
+		}
+	}
+}
+
 // NOTE: streamMarkupFilter.feed is implemented earlier in this file.
 
-func (h *Handler) streamChat(w http.ResponseWriter, model string, spec ModelSpec, token string, publicBase string, hasAttachments bool, userPrompt string, body io.Reader) {
+func (h *Handler) streamChat(w http.ResponseWriter, model string, spec ModelSpec, token string, publicBase string, hasAttachments bool, body io.Reader) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -559,18 +804,19 @@ func (h *Handler) streamChat(w http.ResponseWriter, model string, spec ModelSpec
 	sentRole := false
 	lastMessage := ""
 	sentAny := false
-	var rawAll strings.Builder
 	// Image URL stream handling: prefer full image variants over -part-0 previews.
 	seenFull := map[string]bool{}
 	pendingPart := map[string]string{}
 	emitted := map[string]bool{}
 	sawModelMessage := false
 	emittedFromToken := false
+	lastTextChunkNorm := ""
 
 	var mf *streamMarkupFilter
 	if !hasAttachments {
 		mf = &streamMarkupFilter{}
 	}
+	textRefCollector := newStreamTextImageRefCollector()
 
 	emitChunk := func(delta map[string]interface{}, finish interface{}) {
 		chunk := map[string]interface{}{
@@ -592,6 +838,33 @@ func (h *Handler) streamChat(w http.ResponseWriter, model string, spec ModelSpec
 			flusher.Flush()
 		}
 		sentAny = true
+	}
+
+	emitTextChunk := func(content string) {
+		collapsed := collapseDuplicatedLongChunk(content)
+		if collapsed != content && h != nil && h.cfg != nil && h.cfg.DebugEnabled {
+			slog.Debug("grok stream collapsed duplicated text chunk",
+				"before_chars", utf8.RuneCountInString(strings.TrimSpace(content)),
+				"after_chars", utf8.RuneCountInString(strings.TrimSpace(collapsed)))
+		}
+		content = collapsed
+		norm := strings.TrimSpace(content)
+		if norm == "" {
+			return
+		}
+
+		if norm == lastTextChunkNorm && utf8.RuneCountInString(norm) >= 12 {
+			if h != nil && h.cfg != nil && h.cfg.DebugEnabled {
+				slog.Debug("grok stream skip duplicate text chunk", "chars", utf8.RuneCountInString(norm))
+			}
+			return
+		}
+		emitChunk(map[string]interface{}{"content": content}, nil)
+		if utf8.RuneCountInString(norm) >= 12 {
+			lastTextChunkNorm = norm
+		} else {
+			lastTextChunkNorm = ""
+		}
 	}
 
 	emitImageURL := func(raw string) {
@@ -632,20 +905,23 @@ func (h *Handler) streamChat(w http.ResponseWriter, model string, spec ModelSpec
 			sentRole = true
 		}
 		if tokenDelta, ok := resp["token"].(string); ok && tokenDelta != "" {
-			rawAll.WriteString(tokenDelta)
+			if isThinkingResponse(resp) {
+				// Suppress thinking tokens to avoid leaking chain-of-thought.
+				return nil
+			}
+			textRefCollector.feed(tokenDelta)
 			if mf == nil {
 				// Vision Q/A path: keep text intact but strip full tool/render blocks when present.
-				cleaned := stripToolAndRenderMarkup(tokenDelta)
-				cleaned = stripLeadingAngleNoise(sanitizeText(cleaned))
+				cleaned := sanitizeUpstreamText(tokenDelta)
 				if cleaned != "" {
-					emitChunk(map[string]interface{}{"content": cleaned}, nil)
+					emitTextChunk(cleaned)
 				}
 			} else if !sawModelMessage {
 				// Fallback path: use token deltas only until we observe modelResponse.
 				if cleaned := mf.feed(tokenDelta); cleaned != "" {
 					cleaned = stripLeadingAngleNoise(cleaned)
 					if cleaned != "" {
-						emitChunk(map[string]interface{}{"content": cleaned}, nil)
+						emitTextChunk(cleaned)
 						emittedFromToken = true
 					}
 				}
@@ -655,19 +931,18 @@ func (h *Handler) streamChat(w http.ResponseWriter, model string, spec ModelSpec
 			if msg, ok := mr["message"].(string); ok && strings.TrimSpace(msg) != "" && msg != lastMessage {
 				lastMessage = msg
 				sawModelMessage = true
-				rawAll.WriteString(msg)
+				textRefCollector.feed(msg)
 				if mf == nil {
-					cleaned := stripToolAndRenderMarkup(msg)
-					cleaned = stripLeadingAngleNoise(sanitizeText(cleaned))
+					cleaned := sanitizeUpstreamText(msg)
 					if cleaned != "" {
-						emitChunk(map[string]interface{}{"content": cleaned}, nil)
+						emitTextChunk(cleaned)
 					}
 				} else if !emittedFromToken {
 					// Text streaming path: feed full messages into the filter (handles tool/render blocks) and emit the cleaned text.
 					if cleaned := mf.feed(msg); cleaned != "" {
 						cleaned = stripLeadingAngleNoise(cleaned)
 						if cleaned != "" {
-							emitChunk(map[string]interface{}{"content": cleaned}, nil)
+							emitTextChunk(cleaned)
 						}
 					}
 				}
@@ -675,50 +950,10 @@ func (h *Handler) streamChat(w http.ResponseWriter, model string, spec ModelSpec
 					slog.Debug("grok message contains render/tool markup", "has_modelResponse", true)
 				}
 			}
-			for _, u := range extractImageURLs(mr) {
-				emitImageURL(u)
-			}
-			// Fallback: tool/card payloads may include image URLs outside of the known keys.
-			for _, u := range extractRenderableImageLinks(mr) {
-				emitImageURL(u)
-			}
-			// Extra fallback: scan for asset-like strings inside cards / embedded JSON.
-			for _, p := range collectAssetLikeStrings(mr, 80) {
-				p = strings.TrimSpace(p)
-				if p == "" {
-					continue
-				}
-				if isLikelyImageURL(p) {
-					emitImageURL(p)
-					continue
-				}
-				if isLikelyImageAssetPath(p) {
-					emitImageURL("https://assets.grok.com/" + strings.TrimPrefix(p, "/"))
-					continue
-				}
-			}
+			forEachImageCandidateFromValue(mr, true, true, 80, emitImageURL)
 		}
 		// Broader fallback: sometimes URLs live outside modelResponse.
-		for _, u := range extractImageURLs(resp) {
-			emitImageURL(u)
-		}
-		for _, u := range extractRenderableImageLinks(resp) {
-			emitImageURL(u)
-		}
-		for _, p := range collectAssetLikeStrings(resp, 120) {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
-			if isLikelyImageURL(p) {
-				emitImageURL(p)
-				continue
-			}
-			if isLikelyImageAssetPath(p) {
-				emitImageURL("https://assets.grok.com/" + strings.TrimPrefix(p, "/"))
-				continue
-			}
-		}
+		forEachImageCandidateFromValue(resp, true, true, 120, emitImageURL)
 		if spec.IsVideo {
 			if progress, videoURL, _, ok := extractVideoProgress(resp); ok {
 				if progress > 0 && progress < 100 {
@@ -749,7 +984,7 @@ func (h *Handler) streamChat(w http.ResponseWriter, model string, spec ModelSpec
 		if tail := mf.flush(); tail != "" {
 			tail = stripLeadingAngleNoise(tail)
 			if tail != "" {
-				emitChunk(map[string]interface{}{"content": tail}, nil)
+				emitTextChunk(tail)
 			}
 		}
 		if emittedFromToken && !sawModelMessage && h != nil && h.cfg != nil && h.cfg.DebugEnabled {
@@ -777,14 +1012,8 @@ func (h *Handler) streamChat(w http.ResponseWriter, model string, spec ModelSpec
 		emitImageURL(part)
 	}
 
-	// Final pass: scan accumulated raw text for any image URLs / asset paths that were only present
-	// inside tool/render markup and might not have been captured by structured parsers.
-	for _, u := range extractImageURLsFromText(rawAll.String()) {
-		emitImageURL(u)
-	}
-	for _, p := range extractGrokAssetPathsFromText(rawAll.String()) {
-		emitImageURL("https://assets.grok.com/" + strings.TrimPrefix(p, "/"))
-	}
+	// Final pass: emit URL/path candidates found in incremental text collector.
+	textRefCollector.emit(emitImageURL)
 
 	emitChunk(map[string]interface{}{}, "stop")
 	writeSSE(w, "", "[DONE]")
@@ -793,17 +1022,32 @@ func (h *Handler) streamChat(w http.ResponseWriter, model string, spec ModelSpec
 	}
 }
 
-func (h *Handler) collectChat(w http.ResponseWriter, model string, spec ModelSpec, token string, publicBase string, hasAttachments bool, userPrompt string, body io.Reader) {
+func (h *Handler) collectChat(w http.ResponseWriter, model string, spec ModelSpec, token string, publicBase string, body io.Reader) {
 	id := "chatcmpl_" + randomHex(8)
 	lastMessage := ""
-	sawToken := false
 	videoURL := ""
-	var imageCandidates []string
+	imageCandidates := make([]string, 0, 8)
+	imageCandidateSet := map[string]struct{}{}
 	var tokenContent strings.Builder
+	addImageCandidate := func(raw string) {
+		u := strings.TrimSpace(raw)
+		if u == "" {
+			return
+		}
+		if _, ok := imageCandidateSet[u]; ok {
+			return
+		}
+		imageCandidateSet[u] = struct{}{}
+		imageCandidates = append(imageCandidates, u)
+	}
 
 	err := parseUpstreamLines(body, func(resp map[string]interface{}) error {
+		isThinking := isThinkingResponse(resp)
 		if tokenDelta, ok := resp["token"].(string); ok && tokenDelta != "" {
-			sawToken = true
+			if isThinking {
+				// Suppress thinking tokens to avoid leaking chain-of-thought in OpenAI-compatible output.
+				return nil
+			}
 			tokenContent.WriteString(tokenDelta)
 		}
 		if mr, ok := resp["modelResponse"].(map[string]interface{}); ok {
@@ -813,10 +1057,9 @@ func (h *Handler) collectChat(w http.ResponseWriter, model string, spec ModelSpe
 					slog.Debug("grok message contains render/tool markup", "has_modelResponse", true)
 				}
 			}
-			imageCandidates = append(imageCandidates, extractImageURLs(mr)...)
-			imageCandidates = append(imageCandidates, extractRenderableImageLinks(mr)...)
+			forEachImageCandidateFromValue(mr, true, false, 0, addImageCandidate)
 		}
-		imageCandidates = append(imageCandidates, extractRenderableImageLinks(resp)...)
+		forEachImageCandidateFromValue(resp, false, false, 0, addImageCandidate)
 		if spec.IsVideo {
 			if progress, vurl, _, ok := extractVideoProgress(resp); ok && progress >= 100 && strings.TrimSpace(vurl) != "" {
 				videoURL = strings.TrimSpace(vurl)
@@ -829,16 +1072,14 @@ func (h *Handler) collectChat(w http.ResponseWriter, model string, spec ModelSpe
 		return
 	}
 
-	tokenClean := stripLeadingAngleNoise(sanitizeText(stripToolAndRenderMarkup(tokenContent.String())))
-	modelClean := stripLeadingAngleNoise(sanitizeText(stripToolAndRenderMarkup(lastMessage)))
+	tokenClean := sanitizeUpstreamText(tokenContent.String())
+	modelClean := sanitizeUpstreamText(lastMessage)
 
-	finalContent := tokenClean
-	if modelClean != "" && (finalContent == "" || len(modelClean) > len(finalContent)) {
-		finalContent = modelClean
+	finalContent := modelClean
+	if strings.TrimSpace(finalContent) == "" {
+		finalContent = tokenClean
 	}
-	if !sawToken && modelClean != "" {
-		finalContent = modelClean
-	}
+	finalContent = collapseDuplicatedLongChunk(finalContent)
 
 	if videoURL != "" {
 		if name, err := h.cacheMediaURL(context.Background(), token, videoURL, "video"); err == nil && name != "" {

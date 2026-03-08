@@ -4,15 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"orchids-api/internal/config"
 	"orchids-api/internal/util"
@@ -105,28 +107,61 @@ func (c *Client) userAgent() string {
 var baseHeaders = http.Header{
 	"Accept":             []string{"*/*"},
 	"Accept-Language":    []string{"zh-CN,zh;q=0.9,en;q=0.8"},
+	"Baggage":            []string{"sentry-environment=production,sentry-release=d6add6fb0460641fd482d767a335ef72b9b6abb8,sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c"},
 	"Cache-Control":      []string{"no-cache"},
 	"Content-Type":       []string{"application/json"},
 	"Origin":             []string{"https://grok.com"},
 	"Pragma":             []string{"no-cache"},
 	"Referer":            []string{"https://grok.com/"},
 	"Priority":           []string{"u=1, i"},
+	"Sec-Ch-Ua-Arch":     []string{`"arm"`},
+	"Sec-Ch-Ua-Bitness":  []string{`"64"`},
 	"Sec-Ch-Ua":          []string{`"Google Chrome";v="136", "Chromium";v="136", "Not(A:Brand";v="24"`},
+	"Sec-Ch-Ua-Model":    []string{`""`},
+	"Sec-Ch-Ua-Mobile":   []string{"?0"},
 	"Sec-Ch-Ua-Platform": []string{`"macOS"`},
 	"Sec-Fetch-Dest":     []string{"empty"},
 	"Sec-Fetch-Mode":     []string{"cors"},
 	"Sec-Fetch-Site":     []string{"same-origin"},
-	"sec-ch-ua":          []string{`"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"`},
-	"sec-ch-ua-mobile":   []string{"?0"},
-	"sec-ch-ua-platform": []string{`"Windows"`},
+}
+
+func cloneHeaderShallow(src http.Header, extraCapacity int) http.Header {
+	if extraCapacity < 0 {
+		extraCapacity = 0
+	}
+	if len(src) == 0 {
+		return make(http.Header, extraCapacity)
+	}
+	dst := make(http.Header, len(src)+extraCapacity)
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func buildGrokCookie(token, cfClearance, cfBM string) string {
+	var b strings.Builder
+	b.Grow(len(token)*2 + len(cfClearance) + len(cfBM) + 32)
+	b.WriteString("sso=")
+	b.WriteString(token)
+	b.WriteString("; sso-rw=")
+	b.WriteString(token)
+	if cfClearance != "" {
+		b.WriteString("; cf_clearance=")
+		b.WriteString(cfClearance)
+	}
+	if cfBM != "" {
+		b.WriteString("; __cf_bm=")
+		b.WriteString(cfBM)
+	}
+	return b.String()
 }
 
 func (c *Client) headers(token string) http.Header {
-	// 从预分配的模板克隆请求头
-	h := make(http.Header, len(baseHeaders))
-	for k, v := range baseHeaders {
-		h[k] = v
-	}
+	token = NormalizeSSOToken(token)
+
+	// 从预分配的模板浅克隆请求头；固定值切片复用，动态字段再覆盖。
+	h := cloneHeaderShallow(baseHeaders, 4)
 
 	// 添加动态请求头
 	h.Set("User-Agent", c.userAgent())
@@ -134,14 +169,13 @@ func (c *Client) headers(token string) http.Header {
 	h.Set("x-xai-request-id", randomHex(16))
 
 	// 构建 Cookie
-	cookie := "sso=" + token + "; sso-rw=" + token
-	if c.cfg != nil && strings.TrimSpace(c.cfg.GrokCFClearance) != "" {
-		cookie += "; cf_clearance=" + strings.TrimSpace(c.cfg.GrokCFClearance)
+	cfClearance := ""
+	cfBM := ""
+	if c.cfg != nil {
+		cfClearance = strings.TrimSpace(c.cfg.GrokCFClearance)
+		cfBM = strings.TrimSpace(c.cfg.GrokCFBM)
 	}
-	if c.cfg != nil && strings.TrimSpace(c.cfg.GrokCFBM) != "" {
-		cookie += "; __cf_bm=" + strings.TrimSpace(c.cfg.GrokCFBM)
-	}
-	h.Set("Cookie", cookie)
+	h.Set("Cookie", buildGrokCookie(token, cfClearance, cfBM))
 
 	return h
 }
@@ -152,20 +186,26 @@ func (c *Client) chatPayload(spec ModelSpec, text string, noMemory bool, imageCo
 		cnt = 2
 	}
 	payload := map[string]interface{}{
-		"temporary":             true,
-		"modelName":             spec.UpstreamModel,
-		"message":               text,
-		"fileAttachments":       []string{},
-		"imageAttachments":      []string{},
-		"disableSearch":         false,
-		"enableImageGeneration": true,
-		"returnImageBytes":      false,
-		"enableImageStreaming":  true,
-		"imageGenerationCount":  cnt,
-		"forceConcise":          false,
-		"toolOverrides":         map[string]interface{}{},
-		"enableSideBySide":      true,
-		"sendFinalMetadata":     true,
+		"temporary":                   true,
+		"modelName":                   spec.UpstreamModel,
+		"message":                     text,
+		"fileAttachments":             []string{},
+		"imageAttachments":            []string{},
+		"disableSearch":               false,
+		"enableImageGeneration":       true,
+		"returnImageBytes":            false,
+		"enableImageStreaming":        true,
+		"imageGenerationCount":        cnt,
+		"forceConcise":                false,
+		"forceSideBySide":             false,
+		"isAsyncChat":                 false,
+		"isReasoning":                 false,
+		"disableSelfHarmShortCircuit": false,
+		"disableTextFollowUps":        false,
+		"returnRawGrokInXaiRequest":   false,
+		"toolOverrides":               map[string]interface{}{},
+		"enableSideBySide":            true,
+		"sendFinalMetadata":           true,
 		"responseMetadata": map[string]interface{}{
 			"modelConfigOverride": map[string]interface{}{
 				"modelMap": map[string]interface{}{},
@@ -205,7 +245,6 @@ func (c *Client) doRequest(ctx context.Context, reqURL string, method string, bo
 	if c.cfg != nil && c.cfg.MaxRetries > 0 {
 		maxRetries = c.cfg.MaxRetries
 	}
-	retryStatuses := map[int]struct{}{http.StatusUnauthorized: {}, http.StatusForbidden: {}, http.StatusTooManyRequests: {}}
 	baseDelay := 1 * time.Second
 	if c.cfg != nil && c.cfg.RetryDelay > 0 {
 		baseDelay = time.Duration(c.cfg.RetryDelay) * time.Millisecond
@@ -227,8 +266,9 @@ func (c *Client) doRequest(ctx context.Context, reqURL string, method string, bo
 		if err != nil {
 			return nil, err
 		}
-		req.Header = headers.Clone()
-		req.Header.Set("x-xai-request-id", randomHex(16))
+		reqHeaders := cloneHeaderShallow(headers, 1)
+		reqHeaders.Set("x-xai-request-id", randomHex(16))
+		req.Header = reqHeaders
 
 		resp, err := c.clientForAsset(asset).Do(req)
 		if err == nil && resp.StatusCode == okStatus {
@@ -252,9 +292,11 @@ func (c *Client) doRequest(ctx context.Context, reqURL string, method string, bo
 		_ = resp.Body.Close()
 		lastBody = string(raw)
 
-		if _, ok := retryStatuses[lastStatus]; !ok || attempt >= maxRetries {
+		if lastStatus != http.StatusTooManyRequests || attempt >= maxRetries {
 			return nil, fmt.Errorf("grok upstream status=%d body=%s", lastStatus, lastBody)
 		}
+
+		slog.Debug("doRequest retry triggered", "status", lastStatus, "attempt", attempt, "body", lastBody)
 
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 		delay := backoffDelay(baseDelay, retry429Delay, lastDelay, attempt, lastStatus, retryAfter)
@@ -285,14 +327,15 @@ func (c *Client) VerifyToken(ctx context.Context, token, modelID string) (*RateL
 	if err == nil {
 		return info, nil
 	}
+	slog.Warn("GetUsage failed in VerifyToken, failing back to doChat", "error", err)
 
 	model := strings.TrimSpace(modelID)
 	if model == "" {
-		model = "grok-4.1-fast"
+		model = "grok-3"
 	}
 	spec, ok := ResolveModelOrDynamic(model)
 	if !ok {
-		spec, ok = ResolveModel("grok-4.1-fast")
+		spec, ok = ResolveModel("grok-3")
 		if !ok {
 			return nil, fmt.Errorf("grok default model not available")
 		}
@@ -303,29 +346,60 @@ func (c *Client) VerifyToken(ctx context.Context, token, modelID string) (*RateL
 		return nil, chatErr
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	return parseRateLimitInfo(resp.Header), nil
 }
 
 func (c *Client) GetUsage(ctx context.Context, token, modelID string) (*RateLimitInfo, error) {
+	token = NormalizeSSOToken(token)
+	if strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("empty token")
+	}
+
 	model := strings.TrimSpace(modelID)
+	explicitModel := model != ""
 	if model == "" {
-		model = "grok-4.1-fast"
+		model = "grok-4-1-thinking-1129"
 	}
 	spec, ok := ResolveModelOrDynamic(model)
 	if !ok {
-		spec, ok = ResolveModel("grok-4.1-fast")
+		spec, ok = ResolveModel("grok-4-1-thinking-1129")
 		if !ok {
 			return nil, fmt.Errorf("grok default model not available")
 		}
 	}
 
+	info, err := c.getUsageBySpec(ctx, token, spec)
+	if err == nil {
+		return info, nil
+	}
+
+	// Keep explicit model deterministic. For implicit defaults, degrade to grok-3
+	// if upstream rejects the default model to preserve quota availability.
+	if explicitModel {
+		return nil, err
+	}
+	status := parseUpstreamStatus(err)
+	if status != http.StatusBadRequest && status != http.StatusNotFound && !isGrokModelNotFoundError(err) {
+		return nil, err
+	}
+	fallback, ok := ResolveModel("grok-3")
+	if !ok {
+		return nil, err
+	}
+	info, fallbackErr := c.getUsageBySpec(ctx, token, fallback)
+	if fallbackErr == nil {
+		return info, nil
+	}
+	return nil, fmt.Errorf("grok usage fallback failed (default_err=%v, fallback_err=%w)", err, fallbackErr)
+}
+
+func (c *Client) getUsageBySpec(ctx context.Context, token string, spec ModelSpec) (*RateLimitInfo, error) {
 	payload := map[string]interface{}{
 		"requestKind": "DEFAULT",
 		"modelName":   strings.TrimSpace(spec.UpstreamModel),
 	}
 	if strings.TrimSpace(spec.UpstreamModel) == "" {
-		payload["modelName"] = "grok-4-1-thinking-1129"
+		payload["modelName"] = "grok-3-thinking"
 	}
 
 	raw, err := json.Marshal(payload)
@@ -348,6 +422,14 @@ func (c *Client) GetUsage(ctx context.Context, token, modelID string) (*RateLimi
 		return info, nil
 	}
 	return parseRateLimitInfo(resp.Header), nil
+}
+
+func isGrokModelNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "model is not found") || strings.Contains(lower, "model not found")
 }
 
 func (c *Client) uploadFile(ctx context.Context, token, fileName, fileMimeType, contentBase64 string) (string, string, error) {
@@ -895,17 +977,6 @@ func getProxyField(cfg *config.Config, kind string) string {
 	}
 }
 
-func resolveFallbackProxy(cfg *config.Config) *url.URL {
-	if cfg == nil {
-		return nil
-	}
-	proxyAddr := strings.TrimSpace(cfg.ProxyHTTPS)
-	if proxyAddr == "" {
-		proxyAddr = strings.TrimSpace(cfg.ProxyHTTP)
-	}
-	return resolveGrokProxy(cfg, proxyAddr)
-}
-
 func resolveGrokProxy(cfg *config.Config, proxyAddr string) *url.URL {
 	proxyAddr = strings.TrimSpace(proxyAddr)
 	if proxyAddr == "" {
@@ -922,26 +993,19 @@ func resolveGrokProxy(cfg *config.Config, proxyAddr string) *url.URL {
 }
 
 func newHTTPClient(cfg *config.Config, timeout time.Duration, proxyFunc func(*http.Request) (*url.URL, error)) *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConns = 100
-	transport.MaxIdleConnsPerHost = 20
-	transport.IdleConnTimeout = 90 * time.Second
-	if proxyFunc != nil {
-		transport.Proxy = proxyFunc
-	}
 	if cfg != nil && cfg.GrokUseUTLS {
-		transport = nil
+		return &http.Client{
+			Timeout:   timeout,
+			Transport: newUTLSTransport(proxyFunc),
+		}
 	}
-	var rt http.RoundTripper
-	if cfg != nil && cfg.GrokUseUTLS {
-		rt = newUTLSTransport(proxyFunc)
-	} else {
-		rt = transport
+
+	proxyKey := "direct"
+	if cfg != nil {
+		proxyKey = util.GenerateProxyKey(cfg.ProxyHTTP, cfg.ProxyHTTPS, cfg.ProxyUser)
 	}
-	return &http.Client{
-		Timeout:   timeout,
-		Transport: rt,
-	}
+
+	return util.GetSharedHTTPClient(proxyKey, timeout, proxyFunc)
 }
 
 func parseRetryAfter(raw string) time.Duration {
