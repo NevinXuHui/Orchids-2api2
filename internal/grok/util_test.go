@@ -2,6 +2,7 @@ package grok
 
 import (
 	"errors"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -178,6 +179,12 @@ func TestParseRateLimitPayload_AcceptsQueriesFields(t *testing.T) {
 	if info.Remaining != 23 {
 		t.Fatalf("remaining=%d want=23", info.Remaining)
 	}
+	if !info.HasLimit || !info.HasRemaining {
+		t.Fatalf("expected complete quota pair, got %#v", info)
+	}
+	if info.Unit != "requests" {
+		t.Fatalf("unit=%q want=requests", info.Unit)
+	}
 }
 
 func TestParseRateLimitPayload_SkipsNonNumericMatchedField(t *testing.T) {
@@ -231,6 +238,73 @@ func TestParseRateLimitPayload_CollectsNestedResetAndNumbers(t *testing.T) {
 	}
 	if !info.ResetAt.Equal(wantReset) {
 		t.Fatalf("reset=%v want=%v", info.ResetAt, wantReset)
+	}
+}
+
+func TestParseRateLimitPayload_PrefersTokenPairOverRequestPair(t *testing.T) {
+	payload := map[string]interface{}{
+		"limits": map[string]interface{}{
+			"maxTokens":        500000,
+			"remainingTokens":  499000,
+			"maxQueries":       140,
+			"remainingQueries": 23,
+		},
+	}
+
+	info := parseRateLimitPayload(payload)
+	if info == nil {
+		t.Fatalf("parseRateLimitPayload returned nil")
+	}
+	if info.Limit != 500000 || info.Remaining != 499000 {
+		t.Fatalf("unexpected info: %#v", info)
+	}
+	if info.Unit != "tokens" {
+		t.Fatalf("unit=%q want=tokens", info.Unit)
+	}
+}
+
+func TestParseRateLimitPayload_PrefersTokensWhenQueriesAreZero(t *testing.T) {
+	payload := map[string]interface{}{
+		"windowSizeSeconds": 72000,
+		"remainingQueries":  0,
+		"totalQueries":      0,
+		"remainingTokens":   80,
+		"totalTokens":       80,
+		"lowEffortRateLimits": map[string]interface{}{
+			"cost":             1,
+			"remainingQueries": 80,
+		},
+	}
+
+	info := parseRateLimitPayload(payload)
+	if info == nil {
+		t.Fatalf("parseRateLimitPayload returned nil")
+	}
+	if info.Limit != 80 || info.Remaining != 80 {
+		t.Fatalf("unexpected info: %#v", info)
+	}
+	if info.Unit != "tokens" {
+		t.Fatalf("unit=%q want=tokens", info.Unit)
+	}
+}
+
+func TestParseRateLimitPayload_IncompletePairKeepsPresenceFlags(t *testing.T) {
+	payload := map[string]interface{}{
+		"maxQueries": 80,
+	}
+
+	info := parseRateLimitPayload(payload)
+	if info == nil {
+		t.Fatalf("parseRateLimitPayload returned nil")
+	}
+	if !info.HasLimit || info.HasRemaining {
+		t.Fatalf("expected incomplete info with limit only, got %#v", info)
+	}
+	if info.Limit != 80 || info.Remaining != 0 {
+		t.Fatalf("unexpected values: %#v", info)
+	}
+	if info.Unit != "requests" {
+		t.Fatalf("unit=%q want=requests", info.Unit)
 	}
 }
 
@@ -367,5 +441,78 @@ func BenchmarkParseRateLimitValue_CompoundHeader(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_, _ = parseRateLimitValue(raw)
+	}
+}
+
+func TestEncodeJSONBytesMatchesEncodeJSON(t *testing.T) {
+	payload := map[string]interface{}{
+		"type": "chunk",
+		"data": map[string]interface{}{
+			"text": "hello <world>",
+			"n":    1,
+		},
+	}
+	if got, want := string(encodeJSONBytes(payload)), encodeJSON(payload); got != want {
+		t.Fatalf("got=%q want=%q", got, want)
+	}
+}
+
+func TestWriteSSEBytesMatchesWriteSSE(t *testing.T) {
+	stringRec := httptest.NewRecorder()
+	writeSSE(stringRec, "demo", `{"ok":true}`)
+
+	bytesRec := httptest.NewRecorder()
+	writeSSEBytes(bytesRec, "demo", []byte(`{"ok":true}`))
+
+	if bytesRec.Body.String() != stringRec.Body.String() {
+		t.Fatalf("bytes=%q want=%q", bytesRec.Body.String(), stringRec.Body.String())
+	}
+}
+
+func BenchmarkEncodeJSON_String(b *testing.B) {
+	payload := map[string]interface{}{
+		"id": "msg_1",
+		"choices": []map[string]interface{}{{
+			"index": 0,
+			"delta": map[string]interface{}{"content": "hello world"},
+		}},
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = encodeJSON(payload)
+	}
+}
+
+func BenchmarkEncodeJSON_Bytes(b *testing.B) {
+	payload := map[string]interface{}{
+		"id": "msg_1",
+		"choices": []map[string]interface{}{{
+			"index": 0,
+			"delta": map[string]interface{}{"content": "hello world"},
+		}},
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = encodeJSONBytes(payload)
+	}
+}
+
+func BenchmarkWriteSSE_String(b *testing.B) {
+	writer := httptest.NewRecorder()
+	data := `{"ok":true}`
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		writer.Body.Reset()
+		writeSSE(writer, "demo", data)
+	}
+}
+
+func BenchmarkWriteSSE_Bytes(b *testing.B) {
+	writer := httptest.NewRecorder()
+	data := []byte(`{"ok":true}`)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		writer.Body.Reset()
+		writeSSEBytes(writer, "demo", data)
 	}
 }

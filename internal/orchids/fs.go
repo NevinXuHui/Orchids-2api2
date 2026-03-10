@@ -1,6 +1,7 @@
 package orchids
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -44,19 +45,9 @@ type fsOperation struct {
 }
 
 func (c *Client) handleFSOperation(conn *websocket.Conn, msg map[string]interface{}, onResult func(success bool, data interface{}, errMsg string), overrideWorkdir string) error {
-	operation, _ := msg["operation"].(string)
-	path, _ := msg["path"].(string)
-	slog.Debug("Orchids FS request", "op", operation, "path", path, "overrideWorkdir", overrideWorkdir)
+	op := decodeFSOperation(msg)
+	slog.Debug("Orchids FS request", "op", op.Operation, "path", op.Path, "overrideWorkdir", overrideWorkdir)
 	start := time.Now()
-	raw, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-
-	var op fsOperation
-	if err := json.Unmarshal(raw, &op); err != nil {
-		return err
-	}
 
 	respond := func(success bool, data interface{}, errMsg string) error {
 		if c.config.DebugEnabled {
@@ -82,7 +73,7 @@ func (c *Client) handleFSOperation(conn *websocket.Conn, msg map[string]interfac
 		return conn.WriteJSON(payload)
 	}
 
-	operation = strings.ToLower(strings.TrimSpace(operation))
+	operation := strings.ToLower(strings.TrimSpace(op.Operation))
 	if operation == "" {
 		return respond(false, nil, "missing operation")
 	}
@@ -307,6 +298,42 @@ func (c *Client) handleFSOperation(conn *websocket.Conn, msg map[string]interfac
 	}
 }
 
+func decodeFSOperation(msg map[string]interface{}) fsOperation {
+	if msg == nil {
+		return fsOperation{}
+	}
+	op := fsOperation{
+		ID:        mapStringValue(msg, "id"),
+		Operation: mapStringValue(msg, "operation"),
+		Path:      mapStringValue(msg, "path"),
+		Content:   msg["content"],
+		Command:   mapStringValue(msg, "command"),
+		Pattern:   mapStringValue(msg, "pattern"),
+		BashID:    mapStringValue(msg, "bash_id", "bashId"),
+	}
+	if v, ok := msg["is_background"].(bool); ok {
+		op.IsBackground = v
+	} else if v, ok := msg["isBackground"].(bool); ok {
+		op.IsBackground = v
+	}
+	if params, ok := msg["globParameters"].(map[string]interface{}); ok {
+		op.GlobParameters = params
+	}
+	if params, ok := msg["ripgrepParameters"].(map[string]interface{}); ok {
+		op.RipgrepParams = params
+	}
+	return op
+}
+
+func mapStringValue(msg map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := msg[key].(string); ok {
+			return value
+		}
+	}
+	return ""
+}
+
 func resolvePath(baseDir, input string) (string, error) {
 	if baseDir == "" {
 		return "", errors.New("base directory is empty")
@@ -442,7 +469,7 @@ func writeFile(path string, content string) error {
 	if len(snippet) > 200 {
 		snippet = snippet[:200]
 	}
-	slog.Info("Orchids FS: writeFile", "path", path, "content_len", len(content), "snippet", snippet)
+	slog.Debug("Orchids FS: writeFile", "path", path, "content_len", len(content), "snippet", snippet)
 
 	// Safeguard: Don't overwrite an existing non-empty file with empty content
 	if content == "" {
@@ -618,8 +645,11 @@ func grepSearch(baseDir, root, pattern string, ignore []string) (string, error) 
 		reader := perf.AcquireBufioReader(file)
 		defer perf.ReleaseBufioReader(reader)
 		lineNum := 0
+		var lineScratch []byte
+		var matchScratch []byte
 		for {
-			line, err := reader.ReadString('\n')
+			line, nextScratch, err := readLineBytes(reader, lineScratch)
+			lineScratch = nextScratch[:0]
 			if err != nil && !errors.Is(err, io.EOF) {
 				break
 			}
@@ -627,10 +657,10 @@ func grepSearch(baseDir, root, pattern string, ignore []string) (string, error) 
 				break
 			}
 			lineNum++
-			text := strings.TrimSuffix(line, "\n")
-			text = strings.TrimSuffix(text, "\r")
-			if re.MatchString(text) {
-				lines = append(lines, fmt.Sprintf("%s:%d:%s", path, lineNum, text))
+			line = trimTrailingLineBreakBytes(line)
+			if re.Match(line) {
+				matchScratch = appendGrepMatchLine(matchScratch[:0], path, lineNum, line)
+				lines = append(lines, string(matchScratch))
 				count++
 				if fsMaxLines > 0 && count >= fsMaxLines {
 					break
@@ -653,6 +683,51 @@ func grepSearch(baseDir, root, pattern string, ignore []string) (string, error) 
 		output = output[:fsMaxOutputSize]
 	}
 	return output, nil
+}
+
+func appendGrepMatchLine(dst []byte, path string, lineNum int, line []byte) []byte {
+	dst = append(dst, path...)
+	dst = append(dst, ':')
+	dst = strconv.AppendInt(dst, int64(lineNum), 10)
+	dst = append(dst, ':')
+	dst = append(dst, line...)
+	return dst
+}
+
+func readLineBytes(reader *bufio.Reader, scratch []byte) ([]byte, []byte, error) {
+	scratch = scratch[:0]
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		switch {
+		case err == nil:
+			if len(scratch) == 0 {
+				return fragment, scratch, nil
+			}
+			scratch = append(scratch, fragment...)
+			return scratch, scratch, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			scratch = append(scratch, fragment...)
+		case errors.Is(err, io.EOF):
+			if len(fragment) == 0 && len(scratch) == 0 {
+				return nil, scratch, io.EOF
+			}
+			scratch = append(scratch, fragment...)
+			return scratch, scratch, io.EOF
+		default:
+			return nil, scratch, err
+		}
+	}
+}
+
+func trimTrailingLineBreakBytes(line []byte) []byte {
+	for len(line) > 0 {
+		last := line[len(line)-1]
+		if last != '\n' && last != '\r' {
+			break
+		}
+		line = line[:len(line)-1]
+	}
+	return line
 }
 
 func runShellCommand(baseDir, command string) (string, error) {

@@ -198,9 +198,104 @@ func isSuggestionMode(messages []prompt.Message) bool {
 	return false
 }
 
+func buildLocalSuggestion(messages []prompt.Message) string {
+	lastUser := lastNonSuggestionUserText(messages)
+	lastAssistant := lastAssistantText(messages)
+	if lastAssistant == "" {
+		return ""
+	}
+	if !hasExplicitNextStepOffer(lastAssistant) {
+		return ""
+	}
+	if containsHan(lastUser) || containsHan(lastAssistant) {
+		return "可以"
+	}
+	return "go ahead"
+}
+
 func containsSuggestionMode(text string) bool {
 	clean := stripSystemRemindersForMode(text)
 	return strings.Contains(strings.ToLower(clean), "suggestion mode")
+}
+
+func lastNonSuggestionUserText(messages []prompt.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if !strings.EqualFold(strings.TrimSpace(msg.Role), "user") {
+			continue
+		}
+		text := strings.TrimSpace(stripSystemRemindersForMode(msg.ExtractText()))
+		if text == "" || containsSuggestionMode(text) {
+			continue
+		}
+		return text
+	}
+	return ""
+}
+
+func lastAssistantText(messages []prompt.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if !strings.EqualFold(strings.TrimSpace(msg.Role), "assistant") {
+			continue
+		}
+		text := strings.TrimSpace(stripSystemRemindersForMode(msg.ExtractText()))
+		if text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func hasExplicitNextStepOffer(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	englishMarkers := []string{
+		"if you want",
+		"if you'd like",
+		"if you need",
+		"i can continue",
+		"i can also",
+		"i can help",
+		"i can restart",
+		"i can check",
+		"i can review",
+		"i can commit",
+		"i can push",
+	}
+	for _, marker := range englishMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	chineseMarkers := []string{
+		"如果你要",
+		"如果需要",
+		"如果你愿意",
+		"要的话",
+		"需要的话",
+		"我可以继续",
+		"我可以直接",
+		"我可以帮你",
+		"我下一步可以",
+	}
+	for _, marker := range chineseMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsHan(text string) bool {
+	for _, r := range text {
+		if unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
+	return false
 }
 
 func isTopicClassifierRequest(req ClaudeRequest) bool {
@@ -316,8 +411,24 @@ func generateTopicTitle(text string) string {
 // stripSystemRemindersForMode 移除 <system-reminder>...</system-reminder>，避免误判 plan/suggestion 模式
 // 使用 LastIndex 查找结束标签，正确处理嵌套的字面量标签
 func stripSystemRemindersForMode(text string) string {
-	const startTag = "<system-reminder>"
-	const endTag = "</system-reminder>"
+	text = stripNestedModeTaggedBlock(text, "system-reminder")
+	for _, tag := range []string{
+		"local-command-caveat",
+		"command-name",
+		"command-message",
+		"command-args",
+		"local-command-stdout",
+		"local-command-stderr",
+		"local-command-exit-code",
+	} {
+		text = stripSimpleModeTaggedBlock(text, tag)
+	}
+	return text
+}
+
+func stripNestedModeTaggedBlock(text string, tag string) string {
+	startTag := "<" + tag + ">"
+	endTag := "</" + tag + ">"
 	if !strings.Contains(text, startTag) {
 		return text
 	}
@@ -334,6 +445,34 @@ func stripSystemRemindersForMode(text string) string {
 		blockStart := i + start
 		endStart := blockStart + len(startTag)
 		end := strings.LastIndex(text[endStart:], endTag)
+		if end == -1 {
+			sb.WriteString(text[blockStart:])
+			break
+		}
+		i = endStart + end + len(endTag)
+	}
+	return sb.String()
+}
+
+func stripSimpleModeTaggedBlock(text string, tag string) string {
+	startTag := "<" + tag + ">"
+	endTag := "</" + tag + ">"
+	if !strings.Contains(text, startTag) {
+		return text
+	}
+	var sb strings.Builder
+	sb.Grow(len(text))
+	i := 0
+	for i < len(text) {
+		start := strings.Index(text[i:], startTag)
+		if start == -1 {
+			sb.WriteString(text[i:])
+			break
+		}
+		sb.WriteString(text[i : i+start])
+		blockStart := i + start
+		endStart := blockStart + len(startTag)
+		end := strings.Index(text[endStart:], endTag)
 		if end == -1 {
 			sb.WriteString(text[blockStart:])
 			break

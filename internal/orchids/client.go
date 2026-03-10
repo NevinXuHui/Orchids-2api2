@@ -26,6 +26,78 @@ import (
 	"orchids-api/internal/util"
 )
 
+const orchidsSSEDataPrefix = "data: "
+
+var orchidsSSEDataPrefixBytes = []byte(orchidsSSEDataPrefix)
+
+type orchidsFastEnvelope struct {
+	Type string `json:"type"`
+}
+
+type orchidsFastTextMessage struct {
+	Type  string `json:"type"`
+	Delta string `json:"delta"`
+	Text  string `json:"text"`
+	Data  struct {
+		Text string `json:"text"`
+	} `json:"data"`
+	Chunk json.RawMessage `json:"chunk"`
+}
+
+type orchidsFastChunk struct {
+	Text    string `json:"text"`
+	Content string `json:"content"`
+}
+
+type orchidsFastUsage struct {
+	InputTokens       interface{} `json:"inputTokens"`
+	OutputTokens      interface{} `json:"outputTokens"`
+	InputTokensSnake  interface{} `json:"input_tokens"`
+	OutputTokensSnake interface{} `json:"output_tokens"`
+}
+
+type orchidsFastTokensMessage struct {
+	Type string           `json:"type"`
+	Data orchidsFastUsage `json:"data"`
+}
+
+type orchidsFastToolOutput struct {
+	Type      string      `json:"type"`
+	CallID    string      `json:"callId"`
+	ID        string      `json:"id"`
+	Name      string      `json:"name"`
+	Arguments string      `json:"arguments"`
+	Input     interface{} `json:"input"`
+}
+
+type orchidsFastResponseDone struct {
+	Type     string `json:"type"`
+	Response struct {
+		Usage  orchidsFastUsage        `json:"usage"`
+		Output []orchidsFastToolOutput `json:"output"`
+	} `json:"response"`
+}
+
+type orchidsFastModelMessage struct {
+	Type  string          `json:"type"`
+	Event json.RawMessage `json:"event"`
+}
+
+type orchidsFastModelEvent struct {
+	Type         string `json:"type"`
+	FinishReason string `json:"finishReason"`
+}
+
+type orchidsFastErrorMessage struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Code    string `json:"code"`
+	Data    struct {
+		Message string `json:"message"`
+		Code    string `json:"code"`
+	} `json:"data"`
+}
+
 const defaultUpstreamBaseURL = "https://orchids-server.calmstone-6964e08a.westeurope.azurecontainerapps.io"
 const upstreamURL = defaultUpstreamBaseURL + "/agent/coding-agent"
 
@@ -85,6 +157,21 @@ var noActiveSessionLogState = struct {
 }
 
 const noActiveSessionLogInterval = 5 * time.Minute
+
+func traceIDForLog(req upstream.UpstreamRequest) string {
+	traceID := strings.TrimSpace(req.TraceID)
+	if traceID == "" {
+		return "unknown"
+	}
+	return traceID
+}
+
+func attemptForLog(req upstream.UpstreamRequest) int {
+	if req.Attempt <= 0 {
+		return 1
+	}
+	return req.Attempt
+}
 
 func shouldLogNoActiveSession(key string) bool {
 	if strings.TrimSpace(key) == "" {
@@ -178,6 +265,18 @@ func NewFromAccount(acc *store.Account, base *config.Config) *Client {
 	}
 	c.wsPool = upstream.NewWSPool(c.createWSConnection, 5, 20)
 	return c
+}
+
+func (c *Client) Close() {
+	if c == nil {
+		return
+	}
+	if c.wsPool != nil {
+		c.wsPool.Close()
+	}
+	if c.fsCache != nil {
+		c.fsCache.Close()
+	}
 }
 
 func (c *Client) GetToken() (string, error) {
@@ -431,12 +530,14 @@ func (c *Client) SendRequestWithPayload(ctx context.Context, req upstream.Upstre
 		debugEnabled = cfg.DebugEnabled
 	}
 	if debugEnabled {
-		slog.Debug("Sending upstream request", "mode", mode, "url", c.upstreamURL(), "timeout", timeout)
+		slog.Debug("Sending upstream request", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "mode", mode, "url", c.upstreamURL(), "timeout", timeout)
 	}
 	if mode == "ws" || mode == "websocket" {
+		slog.Info("Orchids transport dispatch", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "transport", "ws", "chat_session_id", req.ChatSessionID, "model", req.Model)
 		err := c.sendRequestWSAIClient(ctx, req, onMessage, logger)
 		if err != nil {
 			if isWSFallback(err) && ctx.Err() == nil {
+				slog.Warn("Orchids transport fallback", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "from", "ws", "to", "sse", "chat_session_id", req.ChatSessionID, "error", err)
 				if logger != nil {
 					logger.LogUpstreamSSE("ws_fallback", err.Error())
 				}
@@ -446,6 +547,7 @@ func (c *Client) SendRequestWithPayload(ctx context.Context, req upstream.Upstre
 		}
 		return nil
 	}
+	slog.Info("Orchids transport dispatch", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "transport", "sse", "chat_session_id", req.ChatSessionID, "model", req.Model)
 	return c.sendRequestSSE(ctx, req, onMessage, logger)
 }
 
@@ -518,6 +620,7 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 	}
 
 	url := c.upstreamURL()
+	slog.Info("Orchids SSE request start", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "chat_session_id", payload.ChatSessionID, "agent_mode", payload.AgentMode, "history_items", len(payload.ChatHistory), "tool_count", len(payloadTools))
 
 	// 使用 Circuit Breaker 保护上游调用
 	breaker := upstream.GetAccountBreaker(email)
@@ -552,6 +655,7 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 		if logger != nil {
 			logger.LogUpstreamHTTPError(url, 0, "", err)
 		}
+		slog.Warn("Orchids SSE request failed before response", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "chat_session_id", payload.ChatSessionID, "error", err)
 		if debugEnabled {
 			slog.Info("[Performance] Upstream Request Failed", "duration", time.Since(start), "error", err)
 		}
@@ -562,12 +666,14 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 	}
 	resp := result.(*http.Response)
 	defer resp.Body.Close()
+	slog.Info("Orchids SSE response headers received", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "chat_session_id", payload.ChatSessionID, "status_code", resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return fmt.Errorf("upstream request failed with status %d (failed to read error body: %v)", resp.StatusCode, err)
 		}
+		slog.Warn("Orchids SSE non-200 response", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "chat_session_id", payload.ChatSessionID, "status_code", resp.StatusCode)
 		return fmt.Errorf("upstream request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -576,11 +682,9 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 	reader := perf.AcquireBufioReader(limitedBody)
 	defer perf.ReleaseBufioReader(reader)
 
-	buffer := perf.AcquireStringBuilder()
-	defer perf.ReleaseStringBuilder(buffer)
-
 	var state requestState
 	var fsWG sync.WaitGroup
+	var lineScratch []byte
 
 	for {
 		select {
@@ -589,40 +693,51 @@ func (c *Client) sendRequestSSE(ctx context.Context, req upstream.UpstreamReques
 		default:
 		}
 
-		line, err := reader.ReadString('\n')
-		if err != nil {
+		line, nextScratch, err := readLineBytes(reader, lineScratch)
+		lineScratch = nextScratch[:0]
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if err == io.EOF && len(line) == 0 {
+			break
+		}
+
+		rawBytes, ok := orchidsSSEDataPayloadBytes(line)
+		if !ok {
 			if err == io.EOF {
 				break
 			}
-			return err
+			continue
+		}
+		if handled, shouldBreak := c.handleOrchidsRawMessage(rawBytes, &state, onMessage, logger); handled {
+			if shouldBreak {
+				goto done
+			}
+			if err == io.EOF {
+				break
+			}
+			continue
 		}
 
-		buffer.WriteString(line)
-
-		if line == "\n" {
-			eventData := buffer.String()
-			buffer.Reset()
-
-			lines := strings.Split(eventData, "\n")
-			for _, l := range lines {
-				if strings.HasPrefix(l, "data: ") {
-					rawData := strings.TrimPrefix(l, "data: ")
-
-					var msg map[string]interface{}
-					if err := json.Unmarshal([]byte(rawData), &msg); err != nil {
-						continue
-					}
-
-					if shouldBreak := c.handleOrchidsMessage(msg, []byte(rawData), &state, onMessage, logger, nil, &fsWG, req.Workdir); shouldBreak {
-						goto done
-					}
-				}
+		var msg map[string]interface{}
+		if err := json.Unmarshal(rawBytes, &msg); err != nil {
+			if err == io.EOF {
+				break
 			}
+			continue
+		}
+
+		if shouldBreak := c.handleOrchidsMessage(msg, rawBytes, &state, onMessage, logger, nil, &fsWG, req.Workdir); shouldBreak {
+			goto done
+		}
+		if err == io.EOF {
+			break
 		}
 	}
 
 done:
 	if state.errorMsg != "" {
+		slog.Warn("Orchids SSE stream ended with upstream error", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "chat_session_id", payload.ChatSessionID, "error", state.errorMsg)
 		return fmt.Errorf("orchids upstream error: %s", state.errorMsg)
 	}
 
@@ -650,7 +765,328 @@ done:
 		}
 	}
 
+	slog.Info("Orchids SSE request completed", "trace_id", traceIDForLog(req), "attempt", attemptForLog(req), "chat_session_id", payload.ChatSessionID, "saw_tool_call", state.sawToolCall, "response_started", state.responseStarted)
 	return nil
+}
+
+func orchidsSSEDataPayload(line string) (string, bool) {
+	if !strings.HasPrefix(line, orchidsSSEDataPrefix) {
+		return "", false
+	}
+	raw := line[len(orchidsSSEDataPrefix):]
+	raw = strings.TrimSuffix(raw, "\n")
+	raw = strings.TrimSuffix(raw, "\r")
+	if raw == "" {
+		return "", false
+	}
+	return raw, true
+}
+
+func orchidsSSEDataPayloadBytes(line []byte) ([]byte, bool) {
+	if !bytes.HasPrefix(line, orchidsSSEDataPrefixBytes) {
+		return nil, false
+	}
+	raw := trimTrailingLineBreakBytes(line[len(orchidsSSEDataPrefixBytes):])
+	if len(raw) == 0 {
+		return nil, false
+	}
+	return raw, true
+}
+
+func (c *Client) handleOrchidsRawMessage(
+	rawData []byte,
+	state *requestState,
+	onMessage func(upstream.SSEMessage),
+	logger *debug.Logger,
+) (handled bool, shouldBreak bool) {
+	var envelope orchidsFastEnvelope
+	if err := json.Unmarshal(rawData, &envelope); err != nil {
+		return false, false
+	}
+
+	switch envelope.Type {
+	case EventConnected:
+		if logger != nil {
+			logger.LogUpstreamSSE(envelope.Type, string(rawData))
+		}
+		return true, false
+	case EventResponseStarted:
+		if logger != nil {
+			logger.LogUpstreamSSE(envelope.Type, string(rawData))
+		}
+		if state.responseStarted {
+			state.suppressStarts = true
+			return true, false
+		}
+		state.responseStarted = true
+		return true, false
+	case EventReasoningCompleted:
+		if logger != nil {
+			logger.LogUpstreamSSE(envelope.Type, string(rawData))
+		}
+		state.preferCodingAgent = true
+		if state.reasoningStarted {
+			onMessage(upstream.SSEMessage{Type: "model", Event: map[string]interface{}{"type": "reasoning-end", "id": "0"}})
+			state.reasoningStarted = false
+		}
+		return true, false
+	case EventCodingAgentTokens:
+		var msg orchidsFastTokensMessage
+		if err := json.Unmarshal(rawData, &msg); err != nil {
+			return false, false
+		}
+		if logger != nil {
+			logger.LogUpstreamSSE(msg.Type, string(rawData))
+		}
+		emitOrchidsUsageEvent(msg.Data, onMessage)
+		return true, false
+	case EventReasoningChunk, EventOutputTextDelta, EventResponseChunk:
+		var msg orchidsFastTextMessage
+		if err := json.Unmarshal(rawData, &msg); err != nil {
+			return false, false
+		}
+		text := extractOrchidsFastText(msg)
+		if logger != nil {
+			logger.LogUpstreamSSE(msg.Type, string(rawData))
+		}
+		if text == "" {
+			return true, false
+		}
+		state.preferCodingAgent = true
+		if msg.Type == EventReasoningChunk {
+			if !state.reasoningStarted {
+				state.reasoningStarted = true
+				onMessage(upstream.SSEMessage{Type: "model", Event: map[string]interface{}{"type": "reasoning-start", "id": "0"}})
+			}
+			onMessage(upstream.SSEMessage{Type: "model", Event: map[string]interface{}{"type": "reasoning-delta", "id": "0", "delta": text}})
+			return true, false
+		}
+		if text == state.lastTextDelta && state.lastTextEvent != msg.Type {
+			return true, false
+		}
+		state.lastTextDelta = text
+		state.lastTextEvent = msg.Type
+		if !state.textStarted {
+			state.textStarted = true
+			onMessage(upstream.SSEMessage{Type: "model", Event: map[string]interface{}{"type": "text-start", "id": "0"}})
+		}
+		onMessage(upstream.SSEMessage{Type: "model", Event: map[string]interface{}{"type": "text-delta", "id": "0", "delta": text}})
+		return true, false
+	case EventResponseDone:
+		var msg orchidsFastResponseDone
+		if err := json.Unmarshal(rawData, &msg); err != nil {
+			return false, false
+		}
+		if logger != nil {
+			logger.LogUpstreamSSE(msg.Type, string(rawData))
+		}
+		emitOrchidsUsageEvent(msg.Response.Usage, onMessage)
+		toolCalls := extractToolCallsFromFastResponse(msg)
+		if len(toolCalls) > 0 {
+			for _, call := range toolCalls {
+				onMessage(upstream.SSEMessage{
+					Type: "model.tool-call",
+					Event: map[string]interface{}{
+						"toolCallId": call.id,
+						"toolName":   call.name,
+						"input":      call.input,
+					},
+				})
+				state.sawToolCall = true
+			}
+			if !state.finishSent {
+				onMessage(upstream.SSEMessage{Type: "model", Event: map[string]interface{}{"finishReason": "tool-calls", "type": "finish"}})
+				state.finishSent = true
+			}
+			return true, true
+		}
+		emitOrchidsCompletionTail(state, onMessage)
+		return true, true
+	case EventCodingAgentEnd, EventComplete:
+		if logger != nil {
+			logger.LogUpstreamSSE(envelope.Type, string(rawData))
+		}
+		emitOrchidsCompletionTail(state, onMessage)
+		return true, true
+	case EventModel:
+		var msg orchidsFastModelMessage
+		if err := json.Unmarshal(rawData, &msg); err != nil {
+			return false, false
+		}
+		if logger != nil {
+			logger.LogUpstreamSSE(msg.Type, string(rawData))
+		}
+		if len(msg.Event) == 0 {
+			return true, false
+		}
+		var meta orchidsFastModelEvent
+		if err := json.Unmarshal(msg.Event, &meta); err != nil {
+			return false, false
+		}
+		if state.suppressStarts && meta.Type == "stream-start" {
+			return true, false
+		}
+		if state.preferCodingAgent {
+			if meta.Type == "text-start" || meta.Type == "text-delta" || meta.Type == "text-end" ||
+				meta.Type == "reasoning-start" || meta.Type == "reasoning-delta" || meta.Type == "reasoning-end" {
+				return true, false
+			}
+		}
+		return false, false
+	case "error":
+		var msg orchidsFastErrorMessage
+		if err := json.Unmarshal(rawData, &msg); err != nil {
+			return false, false
+		}
+		if logger != nil {
+			logger.LogUpstreamSSE(msg.Type, string(rawData))
+		}
+		errCode, errMsg := extractOrchidsFastError(msg)
+		if errMsg == "" {
+			errMsg = "unknown upstream error"
+		}
+		slog.Warn("Orchids upstream error event", "code", errCode, "message", errMsg)
+		if errCode != "" {
+			state.errorMsg = errCode + ": " + errMsg
+		} else {
+			state.errorMsg = errMsg
+		}
+		onMessage(upstream.SSEMessage{
+			Type: "error",
+			Event: map[string]interface{}{
+				"type":    "error",
+				"code":    errCode,
+				"message": errMsg,
+			},
+		})
+		return true, true
+	default:
+		return false, false
+	}
+}
+
+func extractOrchidsFastText(msg orchidsFastTextMessage) string {
+	if msg.Delta != "" {
+		return msg.Delta
+	}
+	if msg.Text != "" {
+		return msg.Text
+	}
+	if msg.Data.Text != "" {
+		return msg.Data.Text
+	}
+	if len(msg.Chunk) == 0 {
+		return ""
+	}
+	var chunkText string
+	if err := json.Unmarshal(msg.Chunk, &chunkText); err == nil {
+		return chunkText
+	}
+	var chunk orchidsFastChunk
+	if err := json.Unmarshal(msg.Chunk, &chunk); err != nil {
+		return ""
+	}
+	if chunk.Text != "" {
+		return chunk.Text
+	}
+	return chunk.Content
+}
+
+func emitOrchidsUsageEvent(usage orchidsFastUsage, onMessage func(upstream.SSEMessage)) {
+	event := map[string]interface{}{"type": "tokens-used"}
+	if usage.InputTokensSnake != nil {
+		event["inputTokens"] = usage.InputTokensSnake
+	} else if usage.InputTokens != nil {
+		event["inputTokens"] = usage.InputTokens
+	}
+	if usage.OutputTokensSnake != nil {
+		event["outputTokens"] = usage.OutputTokensSnake
+	} else if usage.OutputTokens != nil {
+		event["outputTokens"] = usage.OutputTokens
+	}
+	if len(event) > 1 {
+		onMessage(upstream.SSEMessage{Type: "model", Event: event})
+	}
+}
+
+func emitOrchidsCompletionTail(state *requestState, onMessage func(upstream.SSEMessage)) {
+	if state.textStarted {
+		onMessage(upstream.SSEMessage{Type: "model", Event: map[string]interface{}{"type": "text-end", "id": "0"}})
+	}
+	if state.reasoningStarted {
+		onMessage(upstream.SSEMessage{Type: "model", Event: map[string]interface{}{"type": "reasoning-end", "id": "0"}})
+		state.reasoningStarted = false
+	}
+	if !state.finishSent {
+		finishReason := "stop"
+		if state.sawToolCall {
+			finishReason = "tool-calls"
+		}
+		onMessage(upstream.SSEMessage{Type: "model", Event: map[string]interface{}{"type": "finish", "finishReason": finishReason}})
+		state.finishSent = true
+	}
+}
+
+func extractToolCallsFromFastResponse(msg orchidsFastResponseDone) []orchidsToolCall {
+	if len(msg.Response.Output) == 0 {
+		return nil
+	}
+	var calls []orchidsToolCall
+	for _, item := range msg.Response.Output {
+		if item.Type == "function_call" {
+			id := item.CallID
+			name := item.Name
+			args := item.Arguments
+			if id == "" {
+				id = fallbackOrchidsToolCallID(name, args)
+			}
+			if id == "" || name == "" {
+				continue
+			}
+			calls = append(calls, orchidsToolCall{id: id, name: name, input: args})
+			continue
+		}
+		if item.Type != "tool_use" || item.Name == "" {
+			continue
+		}
+		inputStr := marshalOrchidsToolInput(item.Input)
+		id := item.ID
+		if id == "" {
+			id = fallbackOrchidsToolCallID(item.Name, inputStr)
+		}
+		if id == "" {
+			continue
+		}
+		calls = append(calls, orchidsToolCall{id: id, name: item.Name, input: inputStr})
+	}
+	return calls
+}
+
+func marshalOrchidsToolInput(input interface{}) string {
+	if input == nil {
+		return ""
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func extractOrchidsFastError(msg orchidsFastErrorMessage) (code string, message string) {
+	if msg.Data.Message != "" {
+		message = msg.Data.Message
+	}
+	if msg.Data.Code != "" {
+		code = msg.Data.Code
+	}
+	if message == "" {
+		message = msg.Message
+	}
+	if code == "" {
+		code = msg.Code
+	}
+	return code, message
 }
 
 type UpstreamModel struct {

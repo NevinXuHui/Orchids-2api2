@@ -3,9 +3,33 @@ package grok
 import (
 	"github.com/goccy/go-json"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestStreamMessageDelta(t *testing.T) {
+	tests := []struct {
+		name     string
+		previous string
+		current  string
+		want     string
+	}{
+		{name: "initial", previous: "", current: "你好", want: "你好"},
+		{name: "append", previous: "你", current: "你好！", want: "好！"},
+		{name: "rewrite prefix", previous: "你！rok，", current: "你好！我是 Grok，xAI AI 助手。", want: "好！我是 Grok，xAI AI 助手。"},
+		{name: "shrink", previous: "你好世界", current: "你好", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := streamMessageDelta(tt.previous, tt.current); got != tt.want {
+				t.Fatalf("streamMessageDelta(%q,%q)=%q want=%q", tt.previous, tt.current, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestCollapseDuplicatedLongChunk(t *testing.T) {
 	dup := "Hi! How can I help you today?Hi! How can I help you today?"
@@ -29,7 +53,7 @@ func TestStreamChat_DedupsGreetingRepeat(t *testing.T) {
 			`{"result":{"response":{"token":"` + dup + `"}}}`,
 	)
 
-	h.streamChat(rec, "grok-420", ModelSpec{ID: "grok-420"}, "", "", true, body)
+	h.streamChat(rec, "grok-420", ModelSpec{ID: "grok-420"}, "", "", true, body, nil)
 	contents := extractStreamTextContents(t, rec.Body.String())
 	combined := strings.Join(contents, "")
 	if strings.Count(combined, "Hi! How can I help you today?") != 1 {
@@ -37,6 +61,42 @@ func TestStreamChat_DedupsGreetingRepeat(t *testing.T) {
 	}
 	if strings.Contains(combined, dup) {
 		t.Fatalf("unexpected duplicated greeting in stream, combined=%q", combined)
+	}
+}
+
+func TestStreamChat_PrefersModelResponseOverNoisyTokens(t *testing.T) {
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+
+	body := strings.NewReader(
+		`{"result":{"response":{"token":"你！rok，"}}}` +
+			`{"result":{"response":{"modelResponse":{"message":"你好！我是 Grok，xAI AI 助手。"}}}}` +
+			`{"result":{"response":{"modelResponse":{"message":"你好！我是 Grok，xAI AI 助手，不是之前提到的那个。"}}}}`,
+	)
+
+	h.streamChat(rec, "grok-420", ModelSpec{ID: "grok-420"}, "", "", true, body, nil)
+	combined := strings.Join(extractStreamTextContents(t, rec.Body.String()), "")
+	if strings.Contains(combined, "你！rok，") {
+		t.Fatalf("unexpected noisy token leak, combined=%q raw=%q", combined, rec.Body.String())
+	}
+	if !strings.Contains(combined, "你好！我是 Grok，xAI AI 助手，不是之前提到的那个。") {
+		t.Fatalf("expected final modelResponse text, combined=%q raw=%q", combined, rec.Body.String())
+	}
+}
+
+func TestStreamChat_FallsBackToTokenWhenModelResponseMissing(t *testing.T) {
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+
+	body := strings.NewReader(
+		`{"result":{"response":{"token":"你好"}}}` +
+			`{"result":{"response":{"token":"！我是 Grok。"}}}`,
+	)
+
+	h.streamChat(rec, "grok-420", ModelSpec{ID: "grok-420"}, "", "", true, body, nil)
+	combined := strings.Join(extractStreamTextContents(t, rec.Body.String()), "")
+	if !strings.Contains(combined, "你好！我是 Grok。") {
+		t.Fatalf("expected token fallback text, combined=%q raw=%q", combined, rec.Body.String())
 	}
 }
 
@@ -130,4 +190,87 @@ func extractStreamTextContents(t *testing.T, raw string) []string {
 		}
 	}
 	return out
+}
+
+func TestAppendChatCompletionChunkMatchesMapEncoding(t *testing.T) {
+	tests := []struct {
+		name      string
+		role      string
+		content   string
+		finish    string
+		hasFinish bool
+	}{
+		{name: "role", role: "assistant"},
+		{name: "content", content: "hello world"},
+		{name: "stop", finish: "stop", hasFinish: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := appendChatCompletionChunk(make([]byte, 0, 256), "chatcmpl_1", 123, "grok-4", tt.role, tt.content, tt.finish, tt.hasFinish)
+			var got map[string]interface{}
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal got: %v", err)
+			}
+
+			delta := map[string]interface{}{}
+			if tt.role != "" {
+				delta["role"] = tt.role
+			}
+			if tt.content != "" {
+				delta["content"] = tt.content
+			}
+			finish := interface{}(nil)
+			if tt.hasFinish {
+				finish = tt.finish
+			}
+			wantRaw := encodeJSONBytes(map[string]interface{}{
+				"id":      "chatcmpl_1",
+				"object":  "chat.completion.chunk",
+				"created": int64(123),
+				"model":   "grok-4",
+				"choices": []map[string]interface{}{{
+					"index":         0,
+					"delta":         delta,
+					"logprobs":      nil,
+					"finish_reason": finish,
+				}},
+			})
+			var want map[string]interface{}
+			if err := json.Unmarshal(wantRaw, &want); err != nil {
+				t.Fatalf("unmarshal want: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("got=%#v want=%#v", got, want)
+			}
+		})
+	}
+}
+
+func BenchmarkAppendChatCompletionChunk_Content(b *testing.B) {
+	buf := make([]byte, 0, 256)
+	created := time.Now().Unix()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		raw := appendChatCompletionChunk(buf[:0], "chatcmpl_1", created, "grok-4", "", "hello world", "", false)
+		buf = raw[:0]
+	}
+}
+
+func BenchmarkEncodeChatCompletionChunk_Map(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = encodeJSONBytes(map[string]interface{}{
+			"id":      "chatcmpl_1",
+			"object":  "chat.completion.chunk",
+			"created": int64(123),
+			"model":   "grok-4",
+			"choices": []map[string]interface{}{{
+				"index":         0,
+				"delta":         map[string]interface{}{"content": "hello world"},
+				"logprobs":      nil,
+				"finish_reason": nil,
+			}},
+		})
+	}
 }
