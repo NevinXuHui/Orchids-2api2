@@ -463,6 +463,23 @@ func parseToolCall(data []byte, out *parsedEvent) {
 				toolName = name
 				toolInput = input
 			}
+		case 5: // read_files — always parse, even if toolName was set by an earlier field
+			if wire != 2 {
+				_ = d.skip(wire)
+				continue
+			}
+			payload, err := d.readBytes()
+			if err != nil {
+				return
+			}
+			resolvedName, resolvedInput := parseFallbackToolInput("read_files", payload)
+			if resolvedInput != "" && resolvedInput != "{}" {
+				// Only set toolName/toolInput when read_files actually contains file paths.
+				// The warp server sends an initial empty placeholder event, followed by
+				// a separate event with the real file paths — skip the placeholder.
+				toolName = resolvedName
+				toolInput = resolvedInput
+			}
 		default:
 			if toolName == "" && wire == 2 {
 				payload, err := d.readBytes()
@@ -573,9 +590,201 @@ func normalizeToolInputForToolName(toolName, toolInput string) string {
 			return "{}"
 		}
 		return string(b)
+	case "read":
+		normalized := normalizeWarpReadToolInput(input)
+		if normalized != "" {
+			return normalized
+		}
+		return input
 	default:
 		return input
 	}
+}
+
+func normalizeWarpReadToolInput(input string) string {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(input), &payload); err != nil {
+		return ""
+	}
+	path := extractWarpReadPath(payload)
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	minimal := map[string]string{"file_path": path}
+	b, err := json.Marshal(minimal)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func extractWarpReadPath(payload map[string]interface{}) string {
+	for _, key := range []string{"file_path", "path"} {
+		if raw, ok := payload[key]; ok {
+			if path := extractWarpPathLikeString(raw); path != "" {
+				return path
+			}
+		}
+	}
+	for _, key := range []string{"files", "file_paths", "paths"} {
+		if raw, ok := payload[key]; ok {
+			if paths := extractWarpPathList(raw); len(paths) > 0 {
+				return pickWarpPreferredReadPath(paths)
+			}
+		}
+	}
+	for _, raw := range payload {
+		if path := extractWarpPathLikeString(raw); path != "" {
+			return path
+		}
+	}
+	return ""
+}
+
+func extractWarpPathList(raw interface{}) []string {
+	switch v := raw.(type) {
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if path := extractWarpPathLikeString(item); path != "" {
+				out = append(out, path)
+			}
+		}
+		return out
+	default:
+		if path := extractWarpPathLikeString(raw); path != "" {
+			return []string{path}
+		}
+		return nil
+	}
+}
+
+func pickWarpPreferredReadPath(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	score := func(path string) int {
+		base := strings.ToLower(strings.TrimSpace(path))
+		switch {
+		case strings.HasSuffix(base, "/readme.md"), base == "readme.md":
+			return 0
+		case strings.HasSuffix(base, "/pyproject.toml"), base == "pyproject.toml":
+			return 1
+		case strings.HasSuffix(base, "/requirements.txt"), base == "requirements.txt":
+			return 2
+		case strings.HasSuffix(base, "/package.json"), base == "package.json":
+			return 3
+		case strings.HasSuffix(base, "/go.mod"), base == "go.mod":
+			return 4
+		case strings.HasSuffix(base, "/api.py"), base == "api.py":
+			return 5
+		case strings.HasSuffix(base, "/main.py"), base == "main.py":
+			return 6
+		case strings.HasSuffix(base, "/app.py"), base == "app.py":
+			return 7
+		case strings.HasSuffix(base, "/main.go"), base == "main.go":
+			return 8
+		default:
+			return 100
+		}
+	}
+	best := strings.TrimSpace(paths[0])
+	bestScore := score(best)
+	for _, path := range paths[1:] {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if s := score(path); s < bestScore {
+			best = path
+			bestScore = s
+		}
+	}
+	return best
+}
+
+func extractWarpPathLikeString(raw interface{}) string {
+	switch v := raw.(type) {
+	case string:
+		return findWarpPathInString(v)
+	case []interface{}:
+		for _, item := range v {
+			if path := extractWarpPathLikeString(item); path != "" {
+				return path
+			}
+		}
+	case map[string]interface{}:
+		for _, item := range v {
+			if path := extractWarpPathLikeString(item); path != "" {
+				return path
+			}
+		}
+	}
+	return ""
+}
+
+func findWarpPathInString(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return ""
+	}
+	lines := strings.FieldsFunc(trimmed, func(r rune) bool {
+		return r == '\n' || r == '\r'
+	})
+	if len(lines) == 0 {
+		lines = []string{trimmed}
+	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if path := trimWarpPathCandidate(line); path != "" {
+			return path
+		}
+		if idx := strings.Index(line, "/"); idx >= 0 {
+			if path := trimWarpPathCandidate(line[idx:]); path != "" {
+				return path
+			}
+		}
+		if idx := findWarpWindowsPathStart(line); idx >= 0 {
+			if path := trimWarpPathCandidate(line[idx:]); path != "" {
+				return path
+			}
+		}
+	}
+	return ""
+}
+
+func trimWarpPathCandidate(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "\"'")
+	s = strings.TrimRight(s, ",")
+	s = strings.TrimRight(s, "]})")
+	if looksLikeWarpPathCandidate(s) {
+		return s
+	}
+	return ""
+}
+
+func looksLikeWarpPathCandidate(s string) bool {
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "/") || strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
+		return true
+	}
+	return findWarpWindowsPathStart(s) == 0
+}
+
+func findWarpWindowsPathStart(s string) int {
+	for i := 0; i+2 < len(s); i++ {
+		ch := s[i]
+		if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) && s[i+1] == ':' && (s[i+2] == '\\' || s[i+2] == '/') {
+			return i
+		}
+	}
+	return -1
 }
 
 func parseCallMCPTool(data []byte) (string, string) {
@@ -689,6 +898,41 @@ func parseFallbackToolInput(toolName string, payload []byte) (string, string) {
 		return toolName, string(b)
 	case "apply_file_diffs":
 		return parseApplyFileDiffsPayload(payload)
+	case "read_files":
+		// Proto schema: field 1 = repeated string (file paths)
+		var files []string
+		d := decoder{data: payload}
+		for !d.eof() {
+			field, wire, err := d.readKey()
+			if err != nil {
+				break
+			}
+			if field == 1 && wire == 2 {
+				b, err := d.readBytes()
+				if err != nil {
+					break
+				}
+				if path := strings.TrimSpace(string(b)); path != "" {
+					files = append(files, path)
+				}
+			} else {
+				_ = d.skip(wire)
+			}
+		}
+		if len(files) == 0 {
+			return "Read", "{}"
+		}
+		// Pick the best file to read (prefer project-relevant files)
+		path := pickWarpPreferredReadPath(files)
+		if path == "" {
+			path = files[0]
+		}
+		input := map[string]string{"file_path": path}
+		b, err := json.Marshal(input)
+		if err != nil {
+			return "Read", "{}"
+		}
+		return "Read", string(b)
 	default:
 		// Generic protobuf extraction: pull all string fields so non-shell
 		// tools don't receive empty input.
